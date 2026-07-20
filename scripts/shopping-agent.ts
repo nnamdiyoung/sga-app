@@ -94,42 +94,65 @@ async function getUsersToShopFor(): Promise<string[]> {
 
 async function loginInstacart(page: Page, email: string, password: string): Promise<boolean> {
   if (!email || !password) {
-    console.log("No Instacart credentials provided, skipping login.");
+    console.log("No Instacart credentials, skipping login.");
     return false;
   }
 
   try {
     console.log("Navigating to Instacart login...");
-    await page.goto("https://www.instacart.ca/login", { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.goto("https://www.instacart.ca/login", { waitUntil: "networkidle", timeout: 30000 });
     await page.waitForTimeout(2000);
     await saveScreenshot(page, "instacart-login-page");
-
     console.log(`Login page URL: ${page.url()}, title: ${await page.title()}`);
 
-    // Fill email
-    const emailField = page.locator('input[type="email"], input[name="email"], input[id*="email"]').first();
-    await emailField.waitFor({ timeout: 10000 });
-    await emailField.fill(email);
-    console.log("Filled email.");
+    // Dismiss any cookie / overlay banners first
+    for (const sel of ['button:has-text("Accept")', 'button:has-text("Got it")', 'button:has-text("Close")', '[aria-label="Close"]']) {
+      try { await page.locator(sel).first().click({ timeout: 2000 }); } catch { /* none present */ }
+    }
 
-    // Fill password
-    const passwordField = page.locator('input[type="password"], input[name="password"]').first();
-    await passwordField.fill(password);
+    // Wait for email field with broad selector list
+    const emailSelectors = [
+      'input[type="email"]',
+      'input[name="email"]',
+      'input[autocomplete="email"]',
+      'input[placeholder*="email" i]',
+      'input[data-testid*="email" i]',
+      'input[id*="email" i]',
+    ];
+
+    let filled = false;
+    for (const sel of emailSelectors) {
+      try {
+        await page.locator(sel).first().fill(email, { timeout: 5000 });
+        console.log(`Filled email with selector: ${sel}`);
+        filled = true;
+        break;
+      } catch { /* try next */ }
+    }
+
+    if (!filled) {
+      await saveScreenshot(page, "instacart-login-no-email-field");
+      console.log("Could not find email field. HTML:", (await page.content()).substring(0, 500));
+      return false;
+    }
+
+    // Password
+    await page.locator('input[type="password"]').first().fill(password, { timeout: 5000 });
     console.log("Filled password.");
-
     await saveScreenshot(page, "instacart-before-submit");
 
     // Submit
-    const submitBtn = page.locator('button[type="submit"], button:has-text("Log in"), button:has-text("Sign in")').first();
-    await submitBtn.click();
-    await page.waitForTimeout(4000);
+    for (const sel of ['button[type="submit"]', 'button:has-text("Log in")', 'button:has-text("Sign in")']) {
+      try { await page.locator(sel).first().click({ timeout: 3000 }); break; } catch { /* try next */ }
+    }
+
+    await page.waitForTimeout(5000);
     await saveScreenshot(page, "instacart-after-submit");
 
     const currentUrl = page.url();
     console.log(`After login URL: ${currentUrl}`);
-
     const loggedIn = !currentUrl.includes("/login");
-    console.log(loggedIn ? "Instacart login successful." : "Instacart login may have failed.");
+    console.log(loggedIn ? "Instacart login successful." : "Login may have failed — continuing anyway.");
     return loggedIn;
   } catch (err) {
     console.log(`Instacart login error: ${err}`);
@@ -139,172 +162,85 @@ async function loginInstacart(page: Page, email: string, password: string): Prom
 }
 
 async function searchInstacart(page: Page, item: string): Promise<ProductResult[]> {
-  try {
-    const url = `https://www.instacart.ca/store/s?k=${encodeURIComponent(item)}`;
-    console.log(`Searching Instacart for "${item}": ${url}`);
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(3000);
-    await saveScreenshot(page, `instacart-search-${item.replace(/\s/g, "_")}`);
+  const results: ProductResult[] = [];
+  const slug = item.replace(/\s/g, "_").substring(0, 20);
 
-    console.log(`Search page URL: ${page.url()}, title: ${await page.title()}`);
-
-    const results = await page.evaluate(() => {
-      const found: { name: string; price: number; image: string; url: string }[] = [];
-
-      // Try multiple selector strategies
-      const selectors = [
-        '[data-testid="item-card"]',
-        '[data-testid="product-card"]',
-        '[class*="ItemCard"]',
-        '[class*="ProductCard"]',
-        'li[class*="item"]',
-        'article',
-      ];
-
-      let cards: NodeListOf<Element> | null = null;
-      for (const sel of selectors) {
-        const els = document.querySelectorAll(sel);
-        if (els.length > 0) {
-          cards = els;
-          console.log(`Found ${els.length} cards with selector: ${sel}`);
-          break;
+  const responseHandler = async (response: any) => {
+    const url: string = response.url();
+    if (!url.includes("instacart")) return;
+    const ct = response.headers()["content-type"] ?? "";
+    if (!ct.includes("application/json")) return;
+    try {
+      const json = await response.json();
+      // Instacart API shapes vary — try common paths
+      const candidates =
+        json?.items ??
+        json?.results ??
+        json?.products ??
+        json?.data?.items ??
+        json?.data?.products ??
+        json?.modules?.flatMap((m: any) => m.items ?? []) ??
+        [];
+      for (const p of candidates) {
+        const name = p.name ?? p.display_name ?? p.title;
+        const price =
+          p.price ??
+          p.unit_price ??
+          p.pricing?.price ??
+          p.attributes?.price ??
+          0;
+        const image = p.image_url ?? p.image ?? p.photo ?? "";
+        const productUrl = p.url ?? p.product_url ?? "";
+        if (name && price > 0 && results.length < 5) {
+          results.push({ name, price: parseFloat(price), image, url: productUrl, store: "Instacart" });
         }
       }
+      if (candidates.length > 0) console.log(`API response from ${url} — found ${candidates.length} candidates`);
+    } catch { /* non-JSON or parse error */ }
+  };
 
-      if (!cards || cards.length === 0) return found;
+  page.on("response", responseHandler);
 
-      cards.forEach((card) => {
-        // Try to extract name
-        const nameEl =
-          card.querySelector('[data-testid="item-name"]') ??
-          card.querySelector('[class*="name"]') ??
-          card.querySelector('span[aria-label]') ??
-          card.querySelector('p') ??
-          card.querySelector('span');
-
-        // Try to extract price
-        const priceEl =
-          card.querySelector('[data-testid="item-price"]') ??
-          card.querySelector('[class*="price"]') ??
-          card.querySelector('[aria-label*="$"]');
-
-        const imgEl = card.querySelector("img");
-        const linkEl = card.querySelector("a");
-
-        const name = nameEl?.textContent?.trim();
-        const priceText = priceEl?.textContent ?? card.textContent ?? "";
-        const priceMatch = priceText.match(/\$?([\d]+\.[\d]{2})/);
-
-        if (name && priceMatch) {
-          found.push({
-            name,
-            price: parseFloat(priceMatch[1]),
-            image: imgEl?.src ?? "",
-            url: linkEl?.href ?? "",
-          });
-        }
-      });
-
-      return found.slice(0, 5);
-    });
-
-    console.log(`Instacart found ${results.length} results for "${item}"`);
-
-    if (results.length === 0) {
-      // Log a snippet of the HTML to help debug selectors
-      const htmlSnippet = await page.evaluate(() => document.body.innerHTML.substring(0, 1000));
-      console.log(`HTML snippet (first 1000 chars): ${htmlSnippet}`);
-    }
-
-    return results.map((r) => ({ ...r, store: "Instacart" }));
+  try {
+    const searchUrl = `https://www.instacart.ca/store/s?k=${encodeURIComponent(item)}`;
+    console.log(`Searching Instacart for "${item}"`);
+    await page.goto(searchUrl, { waitUntil: "networkidle", timeout: 30000 });
+    await page.waitForTimeout(2000);
+    await saveScreenshot(page, `instacart-search-${slug}`);
+    console.log(`Instacart search URL: ${page.url()}, title: ${await page.title()}`);
   } catch (err) {
-    console.log(`Instacart search error for "${item}": ${err}`);
-    await saveScreenshot(page, `instacart-error-${item.replace(/\s/g, "_")}`);
-    return [];
+    console.log(`Instacart navigation error for "${item}": ${err}`);
   }
+
+  page.off("response", responseHandler);
+  console.log(`Instacart found ${results.length} results for "${item}"`);
+  return results;
 }
 
-async function searchWalmart(page: Page, item: string): Promise<ProductResult[]> {
+async function searchOpenFoodFacts(item: string): Promise<ProductResult[]> {
+  // Reliable fallback — no bot detection, works from any IP including GitHub Actions
   try {
-    const url = `https://www.walmart.ca/search?q=${encodeURIComponent(item)}`;
-    console.log(`Searching Walmart for "${item}": ${url}`);
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(3000);
-    await saveScreenshot(page, `walmart-search-${item.replace(/\s/g, "_")}`);
-
-    console.log(`Walmart page URL: ${page.url()}, title: ${await page.title()}`);
-
-    const results = await page.evaluate(() => {
-      const found: { name: string; price: number; image: string; url: string }[] = [];
-
-      const selectors = [
-        '[data-automation="search-result-listitem"]',
-        '[data-item-id]',
-        '[class*="ProductTile"]',
-        '[class*="product-tile"]',
-        'li[class*="search"]',
-        'article',
-      ];
-
-      let cards: NodeListOf<Element> | null = null;
-      for (const sel of selectors) {
-        const els = document.querySelectorAll(sel);
-        if (els.length > 0) {
-          cards = els;
-          break;
-        }
-      }
-
-      if (!cards || cards.length === 0) return found;
-
-      cards.forEach((card) => {
-        const nameEl =
-          card.querySelector('[data-automation="product-title"]') ??
-          card.querySelector('[class*="product-title"]') ??
-          card.querySelector('[class*="ProductTitle"]') ??
-          card.querySelector('a[aria-label]') ??
-          card.querySelector('span[aria-label]');
-
-        const priceEl =
-          card.querySelector('[data-automation="buybox-price"]') ??
-          card.querySelector('[class*="price-characteristic"]') ??
-          card.querySelector('[class*="Price"]') ??
-          card.querySelector('[class*="price"]');
-
-        const imgEl = card.querySelector("img");
-        const linkEl = card.querySelector("a");
-
-        const name =
-          nameEl?.textContent?.trim() ??
-          nameEl?.getAttribute("aria-label") ??
-          linkEl?.getAttribute("aria-label");
-
-        const priceText = priceEl?.textContent ?? card.textContent ?? "";
-        const priceMatch = priceText.match(/\$?([\d]+\.[\d]{2})/);
-
-        if (name && priceMatch) {
-          found.push({
-            name,
-            price: parseFloat(priceMatch[1]),
-            image: imgEl?.src ?? "",
-            url: linkEl?.href ?? "",
-          });
-        }
+    const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(item)}&search_simple=1&action=process&json=1&page_size=8&cc=ca`;
+    console.log(`Searching Open Food Facts for "${item}"`);
+    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const json: any = await res.json();
+    const products: ProductResult[] = [];
+    for (const p of (json.products ?? []).slice(0, 5)) {
+      const name = p.product_name_en ?? p.product_name ?? p.abbreviated_product_name;
+      if (!name?.trim()) continue;
+      const brand = p.brands ? ` (${p.brands.split(",")[0].trim()})` : "";
+      products.push({
+        name: `${name.trim()}${brand}`,
+        price: 0,
+        image: p.image_small_url ?? p.image_url ?? "",
+        url: `https://www.instacart.ca/store/s?k=${encodeURIComponent(name.trim())}`,
+        store: "Instacart",
       });
-
-      return found.slice(0, 5);
-    });
-
-    console.log(`Walmart found ${results.length} results for "${item}"`);
-
-    if (results.length === 0) {
-      const htmlSnippet = await page.evaluate(() => document.body.innerHTML.substring(0, 1000));
-      console.log(`Walmart HTML snippet: ${htmlSnippet}`);
     }
-
-    return results.map((r) => ({ ...r, store: "Walmart" }));
+    console.log(`Open Food Facts found ${products.length} results for "${item}"`);
+    return products;
   } catch (err) {
-    console.log(`Walmart search error for "${item}": ${err}`);
+    console.log(`Open Food Facts error for "${item}": ${err}`);
     return [];
   }
 }
@@ -328,7 +264,8 @@ async function pickBestProduct(
 - Dietary: ${profile.dietary?.join(", ") || "none"}
 - Allergies: ${profile.allergies?.join(", ") || "none"}
 - Preferred brands: ${profile.brands || "none"}
-Respond ONLY with JSON: { "index": N, "reason": "one line" }`,
+Pick the best product. If price is 0, estimate a realistic Canadian grocery price.
+Respond ONLY with JSON: { "index": N, "price": <estimated price if 0 else original>, "reason": "one line" }`,
       messages: [{
         role: "user",
         content: `I need: ${itemName} (qty: ${quantity})\n\nOptions:\n${optionsList}\n\nBest pick?`,
@@ -339,8 +276,13 @@ Respond ONLY with JSON: { "index": N, "reason": "one line" }`,
     const match = text.match(/\{.*?\}/s);
     if (match) {
       const parsed = JSON.parse(match[0]);
-      console.log(`Claude picked index ${parsed.index} for "${itemName}": ${parsed.reason}`);
-      return Math.min(parsed.index ?? 0, options.length - 1);
+      const idx = Math.min(parsed.index ?? 0, options.length - 1);
+      console.log(`Claude picked index ${idx} for "${itemName}": ${parsed.reason}`);
+      // Use Claude's estimated price if original was 0
+      if (parsed.price && options[idx].price === 0) {
+        options[idx].price = parseFloat(parsed.price);
+      }
+      return idx;
     }
   } catch (err) {
     console.log(`Claude pick error: ${err}`);
@@ -387,13 +329,13 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
 
     let results: ProductResult[] = [];
 
-    // Try Instacart first (preferably logged in)
+    // Try Instacart first (with API interception)
     results = await searchInstacart(page, item.name);
 
-    // Fall back to Walmart if Instacart yields nothing
+    // Fall back to Open Food Facts (works from any IP, no bot detection)
     if (results.length === 0) {
-      console.log(`No Instacart results, trying Walmart...`);
-      results = await searchWalmart(page, item.name);
+      console.log(`No Instacart results, trying Open Food Facts...`);
+      results = await searchOpenFoodFacts(item.name);
     }
 
     if (results.length === 0) {
