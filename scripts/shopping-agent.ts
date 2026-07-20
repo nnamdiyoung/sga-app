@@ -166,6 +166,24 @@ async function searchInstacart(page: Page, item: string): Promise<ProductResult[
   const results: ProductResult[] = [];
   const slug = item.replace(/\s/g, "_").substring(0, 20);
 
+  function extractPrice(p: any): number {
+    // Try every known Instacart price field shape
+    const raw =
+      p.price ??
+      p.unit_price ??
+      p.pricing?.price ??
+      p.pricing?.unit_price ??
+      p.pricing?.display_price ??
+      p.attributes?.price ??
+      p.displayPrice ??
+      p.display_price ??
+      0;
+    if (!raw) return 0;
+    // Handle string prices like "$3.97" or "3.97"
+    const n = parseFloat(String(raw).replace(/[^0-9.]/g, ""));
+    return isNaN(n) ? 0 : n;
+  }
+
   const responseHandler = async (response: any) => {
     const url: string = response.url();
     if (!url.includes("instacart")) return;
@@ -173,30 +191,32 @@ async function searchInstacart(page: Page, item: string): Promise<ProductResult[
     if (!ct.includes("application/json")) return;
     try {
       const json = await response.json();
-      // Instacart API shapes vary — try common paths
-      const candidates =
+      // Instacart API shapes vary — try common paths including GraphQL
+      const candidates: any[] =
         json?.items ??
         json?.results ??
         json?.products ??
         json?.data?.items ??
         json?.data?.products ??
-        json?.modules?.flatMap((m: any) => m.items ?? []) ??
+        json?.data?.search?.products ??
+        json?.modules?.flatMap((m: any) => m.items ?? m.products ?? []) ??
         [];
-      for (const p of candidates) {
-        const name = p.name ?? p.display_name ?? p.title;
-        const price =
-          p.price ??
-          p.unit_price ??
-          p.pricing?.price ??
-          p.attributes?.price ??
-          0;
-        const image = p.image_url ?? p.image ?? p.photo ?? "";
-        const productUrl = p.url ?? p.product_url ?? "";
-        if (name && price > 0 && results.length < 5) {
-          results.push({ name, price: parseFloat(price), image, url: productUrl, store: "Instacart" });
+      if (candidates.length > 0) {
+        // Log first item structure once to help diagnose field names
+        const first = candidates[0];
+        const priceVal = extractPrice(first);
+        const name = first?.name ?? first?.display_name ?? first?.displayName ?? first?.title;
+        console.log(`API ${url.split("?")[0]} — ${candidates.length} candidates, first: name="${name}" price=${priceVal} keys=${Object.keys(first).slice(0,8).join(",")}`);
+        for (const p of candidates) {
+          const pname = p.name ?? p.display_name ?? p.displayName ?? p.title;
+          const price = extractPrice(p);
+          const image = p.image_url ?? p.image ?? p.photo ?? p.imageUrl ?? "";
+          const productUrl = p.url ?? p.product_url ?? p.productUrl ?? "";
+          if (pname && price > 0 && results.length < 5) {
+            results.push({ name: pname, price, image, url: productUrl, store: "Instacart" });
+          }
         }
       }
-      if (candidates.length > 0) console.log(`API response from ${url} — found ${candidates.length} candidates`);
     } catch { /* non-JSON or parse error */ }
   };
 
@@ -205,8 +225,10 @@ async function searchInstacart(page: Page, item: string): Promise<ProductResult[
   try {
     const searchUrl = `https://www.instacart.ca/store/s?k=${encodeURIComponent(item)}`;
     console.log(`Searching Instacart for "${item}"`);
-    await page.goto(searchUrl, { waitUntil: "networkidle", timeout: 30000 });
-    await page.waitForTimeout(2000);
+    // Use domcontentloaded — networkidle never fires on Instacart's SPA
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    // Wait for XHR search requests to resolve
+    await page.waitForTimeout(8000);
     await saveScreenshot(page, `instacart-search-${slug}`);
     console.log(`Instacart search URL: ${page.url()}, title: ${await page.title()}`);
   } catch (err) {
