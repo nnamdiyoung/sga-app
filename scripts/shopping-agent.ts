@@ -36,6 +36,7 @@ interface ProductResult {
   image: string;
   url: string;
   store: string;
+  itemId?: string;
 }
 
 interface SelectedProduct {
@@ -212,8 +213,9 @@ async function searchInstacart(page: Page, item: string): Promise<ProductResult[
           const price = extractPrice(p);
           const image = p.image_url ?? p.image ?? p.photo ?? p.imageUrl ?? "";
           const productUrl = p.url ?? p.product_url ?? p.productUrl ?? "";
+          const itemId: string = p.id ?? p.item_id ?? p.itemId ?? "";
           if (pname && price > 0 && results.length < 5) {
-            results.push({ name: pname, price, image, url: productUrl, store: "Instacart" });
+            results.push({ name: pname, price, image, url: productUrl, store: "Instacart", itemId });
           }
         }
       }
@@ -265,6 +267,57 @@ async function searchOpenFoodFacts(item: string): Promise<ProductResult[]> {
   } catch (err) {
     console.log(`Open Food Facts error for "${item}": ${err}`);
     return [];
+  }
+}
+
+async function addToInstacartCart(page: Page, product: ProductResult): Promise<boolean> {
+  try {
+    // Build the product page URL from itemId ("items_151403-27268427" → numeric suffix)
+    let productPageUrl = product.url;
+    if (!productPageUrl && product.itemId) {
+      const match = product.itemId.match(/(\d+)$/);
+      if (match) productPageUrl = `https://www.instacart.ca/products/${match[1]}`;
+    }
+
+    if (productPageUrl && productPageUrl.startsWith("http") && !productPageUrl.includes("/store/s?")) {
+      console.log(`Navigating to product page: ${productPageUrl}`);
+      await page.goto(productPageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(4000);
+      await saveScreenshot(page, `product-page-${product.name.substring(0, 15).replace(/\s/g, "_")}`);
+    }
+
+    // Try multiple selector patterns for the "Add to cart" button
+    const addSelectors = [
+      '[data-testid="add-item-to-cart-button"]',
+      '[data-testid*="add-to-cart"]',
+      '[data-testid*="add_to_cart"]',
+      'button[aria-label*="Add to cart" i]',
+      'button[aria-label*="Add" i]:not([aria-label*="address" i])',
+      'button:has-text("Add to cart")',
+      'button:has-text("Add item")',
+      'button:has-text("Add")',
+      '[class*="AddToCart"] button',
+      '[class*="add-to-cart"] button',
+    ];
+
+    for (const sel of addSelectors) {
+      try {
+        const btn = page.locator(sel).first();
+        if (await btn.isVisible({ timeout: 3000 })) {
+          await btn.click();
+          await page.waitForTimeout(2000);
+          await saveScreenshot(page, `after-add-${product.name.substring(0, 15).replace(/\s/g, "_")}`);
+          console.log(`Added "${product.name}" to Instacart cart (selector: ${sel})`);
+          return true;
+        }
+      } catch { continue; }
+    }
+
+    console.log(`Could not find Add button for "${product.name}" — screenshots saved`);
+    return false;
+  } catch (err) {
+    console.log(`addToInstacartCart error for "${product.name}": ${err}`);
+    return false;
   }
 }
 
@@ -386,16 +439,15 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   const page = await context.newPage();
 
   const selectedProducts: SelectedProduct[] = [];
+  let instacartItemsAdded = 0;
 
   for (const item of items) {
     console.log(`\n--- Shopping for: ${item.name} ---`);
 
     let results: ProductResult[] = [];
 
-    // Try Instacart first (with API interception)
     results = await searchInstacart(page, item.name);
 
-    // Fall back to Open Food Facts (works from any IP, no bot detection)
     if (results.length === 0) {
       console.log(`No Instacart results, trying Open Food Facts...`);
       results = await searchOpenFoodFacts(item.name);
@@ -416,6 +468,13 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
       const idx = await pickBestProduct(item.name, item.quantity, results, profile);
       const chosen = results[idx];
       console.log(`Picked: ${chosen.name} @ $${chosen.price} (${chosen.store})`);
+
+      // Add to the actual Instacart cart
+      if (chosen.store === "Instacart") {
+        const added = await addToInstacartCart(page, chosen);
+        if (added) instacartItemsAdded++;
+      }
+
       selectedProducts.push({
         grocery_item_name: item.name,
         product_name: chosen.name,
@@ -452,15 +511,19 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
     .map((p) => `<li><strong>${p.grocery_item_name}</strong> → ${p.product_name} ($${p.price.toFixed(2)} CAD)</li>`)
     .join("\n");
 
+  const instacartReady = instacartItemsAdded > 0;
   await resend.emails.send({
     from: "onboarding@resend.dev",
     to: userEmail,
-    subject: `🛒 Your SGA cart is ready — ${selectedProducts.length} items, ~$${total.toFixed(2)} CAD`,
+    subject: `🛒 Your cart is ready — ${selectedProducts.length} items, ~$${total.toFixed(2)} CAD`,
     html: `
       <h2>Your SGA cart is ready!</h2>
       <p><strong>${selectedProducts.length} items</strong>, approximately <strong>$${total.toFixed(2)} CAD</strong>.</p>
       <ul>${itemListHtml}</ul>
-      <p>Open the SGA app to review and checkout.</p>
+      ${instacartReady
+        ? `<p>✅ <strong>${instacartItemsAdded} item${instacartItemsAdded > 1 ? 's' : ''} added to your Instacart cart.</strong> Just open Instacart and go to checkout.</p>`
+        : `<p>Open the SGA app to review your cart and complete checkout on Instacart.</p>`
+      }
     `,
   });
 
