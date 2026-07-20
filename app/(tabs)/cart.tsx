@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, TouchableOpacity, FlatList,
-  StyleSheet, SafeAreaView, Image, Alert, Modal, ActivityIndicator, Linking
+  StyleSheet, SafeAreaView, Image, Alert, Modal, ActivityIndicator, Linking, RefreshControl
 } from 'react-native'
 import { WebView } from 'react-native-webview'
 import type { WebView as WebViewType } from 'react-native-webview'
@@ -82,6 +82,7 @@ true;`
 export default function CartScreen() {
   const [cart, setCart] = useState<Cart | null>(null)
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
   const [showAddFlow, setShowAddFlow] = useState(false)
   const [addQueue, setAddQueue] = useState<CartItem[]>([])
   const [addIndex, setAddIndex] = useState(0)
@@ -101,9 +102,10 @@ export default function CartScreen() {
     fetchLatestCart()
   }, [])
 
-  async function fetchLatestCart() {
+  async function fetchLatestCart(isRefresh = false) {
+    if (!isRefresh) setLoading(true)
     const { data: { user } } = await supabase.auth.getUser()
-    if (!user) return
+    if (!user) { setLoading(false); return }
     const { data: cartData } = await supabase
       .from('carts')
       .select('*, items:cart_items(*)')
@@ -114,6 +116,12 @@ export default function CartScreen() {
       .single()
     setCart(cartData ?? null)
     setLoading(false)
+    setRefreshing(false)
+  }
+
+  async function handleRefresh() {
+    setRefreshing(true)
+    await fetchLatestCart(true)
   }
 
   async function removeCartItem(itemId: string) {
@@ -134,7 +142,10 @@ export default function CartScreen() {
   function startAddToInstacart() {
     if (!cart || cart.items.length === 0) return
     const instacartItems = cart.items.filter(
-      i => i.product_url && i.product_url.startsWith('https://www.instacart.ca/products/')
+      i => i.product_url && (
+        i.product_url.includes('/products/') ||
+        i.product_url.includes('/product_page/')
+      )
     )
     if (instacartItems.length === 0) {
       Alert.alert('No product links', 'Run the agent again to get direct Instacart product links.')
@@ -274,6 +285,9 @@ export default function CartScreen() {
         data={cart.items}
         keyExtractor={item => item.id}
         contentContainerStyle={styles.list}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} tintColor={colors.primary} />
+        }
         renderItem={({ item }) => (
           <View style={styles.cartItem}>
             {item.image_url ? (

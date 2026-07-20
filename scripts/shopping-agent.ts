@@ -167,12 +167,24 @@ async function loginInstacart(page: Page, email: string, password: string): Prom
   }
 }
 
-async function searchInstacart(page: Page, item: string): Promise<ProductResult[]> {
+function slugToStoreName(slug: string): string {
+  return slug
+    .replace(/-(?:on|qc|bc|ab|mb|sk|ns|nb|pe|nl|nt|yt|nu)$/i, "")
+    .replace(/-/g, " ")
+    .split(" ")
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+async function searchInstacart(
+  page: Page,
+  item: string,
+  lockedStoreSlug?: string
+): Promise<{ results: ProductResult[]; storeSlug: string; storeName: string }> {
   const results: ProductResult[] = [];
-  const slug = item.replace(/\s/g, "_").substring(0, 20);
+  const fileSlug = item.replace(/\s/g, "_").substring(0, 20);
 
   function extractPrice(p: any): number {
-    // Try every known Instacart price field shape
     const raw =
       p.price ??
       p.unit_price ??
@@ -184,7 +196,6 @@ async function searchInstacart(page: Page, item: string): Promise<ProductResult[
       p.display_price ??
       0;
     if (!raw) return 0;
-    // Handle string prices like "$3.97" or "3.97"
     const n = parseFloat(String(raw).replace(/[^0-9.]/g, ""));
     return isNaN(n) ? 0 : n;
   }
@@ -196,7 +207,6 @@ async function searchInstacart(page: Page, item: string): Promise<ProductResult[
     if (!ct.includes("application/json")) return;
     try {
       const json = await response.json();
-      // Instacart API shapes vary — try common paths including GraphQL
       const candidates: any[] =
         json?.items ??
         json?.results ??
@@ -207,11 +217,9 @@ async function searchInstacart(page: Page, item: string): Promise<ProductResult[
         json?.modules?.flatMap((m: any) => m.items ?? m.products ?? []) ??
         [];
       if (candidates.length > 0) {
-        // Log first item structure once to help diagnose field names
         const first = candidates[0];
-        const priceVal = extractPrice(first);
         const name = first?.name ?? first?.display_name ?? first?.displayName ?? first?.title;
-        console.log(`API ${url.split("?")[0]} — ${candidates.length} candidates, first: name="${name}" price=${priceVal} keys=${Object.keys(first).slice(0,8).join(",")}`);
+        console.log(`API ${url.split("?")[0]} — ${candidates.length} candidates, first: name="${name}" keys=${Object.keys(first).slice(0, 8).join(",")}`);
         for (const p of candidates) {
           const pname = p.name ?? p.display_name ?? p.displayName ?? p.title;
           const price = extractPrice(p);
@@ -219,7 +227,6 @@ async function searchInstacart(page: Page, item: string): Promise<ProductResult[
           const productUrl = p.url ?? p.product_url ?? p.productUrl ?? "";
           const itemId: string = p.id ?? p.item_id ?? p.itemId ?? "";
           const productId: string = String(p.productId ?? p.legacyId ?? p.legacy_id ?? "");
-          // Accept items without price — real price scraped from product page later
           if (pname && results.length < 5) {
             results.push({ name: pname, price, image, url: productUrl, store: "Instacart", itemId, productId });
           }
@@ -230,22 +237,37 @@ async function searchInstacart(page: Page, item: string): Promise<ProductResult[
 
   page.on("response", responseHandler);
 
+  let resolvedSlug = lockedStoreSlug ?? "";
+  let resolvedName = resolvedSlug ? slugToStoreName(resolvedSlug) : "Instacart";
+
   try {
-    const searchUrl = `https://www.instacart.ca/store/s?k=${encodeURIComponent(item)}`;
-    console.log(`Searching Instacart for "${item}"`);
-    // Use domcontentloaded — networkidle never fires on Instacart's SPA
+    // Use store-specific search URL if we already know the store
+    const searchUrl = lockedStoreSlug
+      ? `https://www.instacart.ca/store/${lockedStoreSlug}/storefront/s?k=${encodeURIComponent(item)}`
+      : `https://www.instacart.ca/store/s?k=${encodeURIComponent(item)}`;
+    console.log(`Searching Instacart for "${item}"${lockedStoreSlug ? ` (store: ${lockedStoreSlug})` : ""}`);
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-    // Wait for XHR search requests to resolve
     await page.waitForTimeout(8000);
-    await saveScreenshot(page, `instacart-search-${slug}`);
-    console.log(`Instacart search URL: ${page.url()}, title: ${await page.title()}`);
+    await saveScreenshot(page, `instacart-search-${fileSlug}`);
+
+    // Capture store slug from the redirected URL on first search
+    if (!lockedStoreSlug) {
+      const finalUrl = page.url();
+      const match = finalUrl.match(/\/store\/([^/?#]+)/);
+      if (match && match[1] !== "s") {
+        resolvedSlug = match[1];
+        resolvedName = slugToStoreName(resolvedSlug);
+        console.log(`Store detected: ${resolvedName} (${resolvedSlug})`);
+      }
+    }
+    console.log(`Instacart search URL: ${page.url()}`);
   } catch (err) {
     console.log(`Instacart navigation error for "${item}": ${err}`);
   }
 
   page.off("response", responseHandler);
   console.log(`Instacart found ${results.length} results for "${item}"`);
-  return results;
+  return { results, storeSlug: resolvedSlug, storeName: resolvedName };
 }
 
 async function searchOpenFoodFacts(item: string): Promise<ProductResult[]> {
@@ -524,13 +546,22 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   const page = await context.newPage();
 
   const selectedProducts: SelectedProduct[] = [];
+  let lockedStoreSlug = "";
+  let lockedStoreName = "Instacart";
 
   for (const item of items) {
     console.log(`\n--- Shopping for: ${item.name} ---`);
 
-    let results: ProductResult[] = [];
+    const { results: instacartResults, storeSlug, storeName } = await searchInstacart(page, item.name, lockedStoreSlug || undefined);
 
-    results = await searchInstacart(page, item.name);
+    // Lock store after first successful Instacart search
+    if (!lockedStoreSlug && storeSlug) {
+      lockedStoreSlug = storeSlug;
+      lockedStoreName = storeName;
+      console.log(`Store locked to: ${lockedStoreName} for all remaining items`);
+    }
+
+    let results = instacartResults;
 
     if (results.length === 0) {
       console.log(`No Instacart results, trying Open Food Facts...`);
@@ -539,28 +570,31 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
 
     if (results.length === 0) {
       console.log(`No results found for "${item.name}", adding placeholder.`);
+      const fallbackUrl = lockedStoreSlug
+        ? `https://www.instacart.ca/store/${lockedStoreSlug}/storefront/s?k=${encodeURIComponent(item.name)}`
+        : `https://www.instacart.ca/store/s?k=${encodeURIComponent(item.name)}`;
       selectedProducts.push({
         grocery_item_name: item.name,
         product_name: `Search for "${item.name}"`,
         price: 0,
         image_url: "",
-        product_url: `https://www.instacart.ca/store/s?k=${encodeURIComponent(item.name)}`,
-        store: "Instacart",
+        product_url: fallbackUrl,
+        store: lockedStoreName,
         swapped: false,
         quantity: item.quantity,
       });
     } else {
       const idx = await pickBestProduct(item.name, item.quantity, results, profile);
       const chosen = results[idx];
-      console.log(`Picked: ${chosen.name} @ $${chosen.price} (${chosen.store})`);
+      console.log(`Picked: ${chosen.name} @ $${chosen.price} (${lockedStoreName})`);
 
-      // Build a direct Instacart product page URL so the app can add to cart in-app
+      // Build store-specific product URL so the app opens the right store context
       let productUrl = chosen.url;
-      if (chosen.store === "Instacart" && chosen.productId) {
-        productUrl = `https://www.instacart.ca/products/${chosen.productId}`;
-      } else if (chosen.store === "Instacart" && chosen.itemId) {
-        const match = chosen.itemId.match(/(\d+)$/);
-        if (match) productUrl = `https://www.instacart.ca/products/${match[1]}`;
+      const numericId = chosen.productId || chosen.itemId.match(/(\d+)$/)?.[1] || "";
+      if (lockedStoreSlug && numericId) {
+        productUrl = `https://www.instacart.ca/store/${lockedStoreSlug}/product_page/${numericId}`;
+      } else if (numericId) {
+        productUrl = `https://www.instacart.ca/products/${numericId}`;
       }
 
       selectedProducts.push({
@@ -569,7 +603,7 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
         price: chosen.price,
         image_url: chosen.image,
         product_url: productUrl,
-        store: chosen.store,
+        store: lockedStoreName,
         swapped: false,
         quantity: item.quantity,
       });
