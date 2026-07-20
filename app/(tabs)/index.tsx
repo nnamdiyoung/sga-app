@@ -36,9 +36,10 @@ export default function GroceryList() {
           event: 'UPDATE',
           schema: 'public',
           table: 'grocery_items',
-          filter: `user_id=eq.${user.id}`,
-        }, () => {
-          fetchItems()
+        }, (payload) => {
+          if (payload.new.user_id === user.id) {
+            fetchItems()
+          }
         })
         .subscribe()
     }

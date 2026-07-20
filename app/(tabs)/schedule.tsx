@@ -67,11 +67,12 @@ export default function Schedule() {
           event: 'INSERT',
           schema: 'public',
           table: 'carts',
-          filter: `user_id=eq.${user.id}`,
-        }, () => {
-          setAgentRunning(false)
-          setCartReady(true)
-          channel.unsubscribe()
+        }, (payload) => {
+          if (payload.new.user_id === user.id) {
+            setAgentRunning(false)
+            setCartReady(true)
+            channel.unsubscribe()
+          }
         })
         .subscribe()
     })

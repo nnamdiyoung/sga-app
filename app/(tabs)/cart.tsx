@@ -113,10 +113,11 @@ export default function CartScreen() {
           event: 'INSERT',
           schema: 'public',
           table: 'carts',
-          filter: `user_id=eq.${user.id}`,
-        }, () => {
-          fetchLatestCart()
-          showToast()
+        }, (payload) => {
+          if (payload.new.user_id === user.id) {
+            fetchLatestCart()
+            showToast()
+          }
         })
         .subscribe()
     }
