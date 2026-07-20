@@ -324,6 +324,13 @@ async function processUser(userId: string): Promise<void> {
 
   await supabase.from("cart_items").insert(cartItemRows);
 
+  // Clear the grocery list now that it's been shopped
+  await supabase
+    .from("grocery_items")
+    .update({ cleared: true })
+    .eq("user_id", userId)
+    .eq("cleared", false);
+
   const itemListHtml = selectedProducts
     .map(
       (p) =>
