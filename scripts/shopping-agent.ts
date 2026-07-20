@@ -275,7 +275,9 @@ async function searchOpenFoodFacts(item: string): Promise<ProductResult[]> {
   }
 }
 
-async function addToInstacartCart(page: Page, product: ProductResult): Promise<{ added: boolean; price: number }> {
+async function addToInstacartCart(page: Page, product: ProductResult, quantity: string): Promise<{ added: boolean; price: number }> {
+  // Parse quantity — take the first integer found, default to 1
+  const qty = Math.max(1, parseInt(quantity.match(/\d+/)?.[0] ?? "1", 10) || 1);
   try {
     // Build direct product page URL using productId or numeric suffix of itemId
     let productPageUrl = "";
@@ -332,9 +334,33 @@ async function addToInstacartCart(page: Page, product: ProductResult): Promise<{
         const btn = page.locator(sel).first();
         if (await btn.isVisible({ timeout: 3000 })) {
           await btn.click();
-          await page.waitForTimeout(2000);
+          await page.waitForTimeout(1500);
+
+          // Increase quantity beyond 1 by clicking "+" (qty - 1) more times
+          if (qty > 1) {
+            const incrementSelectors = [
+              '[aria-label*="Increase quantity" i]',
+              '[aria-label*="increment" i]',
+              '[data-testid*="increment"]',
+              'button:has-text("+")',
+            ];
+            for (let q = 1; q < qty; q++) {
+              for (const incSel of incrementSelectors) {
+                try {
+                  const incBtn = page.locator(incSel).first();
+                  if (await incBtn.isVisible({ timeout: 2000 })) {
+                    await incBtn.click();
+                    await page.waitForTimeout(500);
+                    break;
+                  }
+                } catch { continue; }
+              }
+            }
+            console.log(`Set quantity to ${qty} for "${product.name}"`);
+          }
+
           await saveScreenshot(page, `after-add-${product.name.substring(0, 15).replace(/\s/g, "_")}`);
-          console.log(`Added "${product.name}" to Instacart cart (selector: ${sel})`);
+          console.log(`Added "${product.name}" (qty ${qty}) to Instacart cart`);
           return { added: true, price: scrapedPrice };
         }
       } catch { continue; }
@@ -499,7 +525,7 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
       // Add to the actual Instacart cart and get real price
       let finalPrice = chosen.price;
       if (chosen.store === "Instacart") {
-        const { added, price } = await addToInstacartCart(page, chosen);
+        const { added, price } = await addToInstacartCart(page, chosen, item.quantity);
         if (added) instacartItemsAdded++;
         if (price > 0) finalPrice = price;
       }
