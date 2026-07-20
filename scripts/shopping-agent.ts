@@ -311,16 +311,27 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   const userEmail = authRes.data?.user?.email;
   if (!userEmail) return;
 
-  // Create a single browser context and page for this user
+  // Load saved Instacart session from GitHub secret (captured once via capture-session.ts)
+  let storageState: any = undefined;
+  const sessionB64 = process.env.INSTACART_SESSION;
+  if (sessionB64) {
+    try {
+      storageState = JSON.parse(Buffer.from(sessionB64, "base64").toString("utf-8"));
+      console.log("Loaded Instacart session from INSTACART_SESSION secret.");
+    } catch {
+      console.log("Failed to parse INSTACART_SESSION — proceeding without session.");
+    }
+  } else {
+    console.log("No INSTACART_SESSION secret found — searches will be anonymous.");
+  }
+
   const context = await browser.newContext({
     userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     viewport: { width: 1280, height: 800 },
     locale: "en-CA",
+    storageState,
   });
   const page = await context.newPage();
-
-  // Log in to Instacart first
-  const instacartLoggedIn = await loginInstacart(page, profile?.instacart_email, profile?.instacart_password);
 
   const selectedProducts: SelectedProduct[] = [];
 

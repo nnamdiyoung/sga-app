@@ -34,6 +34,10 @@ yarn-error.*
 .env
 .env*.local
 
+# Instacart session (contains auth cookies — never commit)
+scripts/instacart-session.json
+scripts/instacart-session.b64
+
 # typescript
 *.tsbuildinfo
 
