@@ -595,7 +595,7 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
 
       // Build store-specific product URL so the app opens the right store context
       let productUrl = chosen.url;
-      const numericId = chosen.productId || chosen.itemId.match(/(\d+)$/)?.[1] || "";
+      const numericId = chosen.productId || chosen.itemId?.match(/(\d+)$/)?.[1] || "";
       if (lockedStoreSlug && numericId) {
         productUrl = `https://www.instacart.ca/store/${lockedStoreSlug}/product_page/${numericId}`;
       } else if (numericId) {
