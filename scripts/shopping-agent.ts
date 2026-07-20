@@ -275,7 +275,7 @@ async function searchOpenFoodFacts(item: string): Promise<ProductResult[]> {
   }
 }
 
-async function addToInstacartCart(page: Page, product: ProductResult, quantity: string): Promise<{ added: boolean; price: number }> {
+async function addToInstacartCart(page: Page, product: ProductResult, quantity: string): Promise<{ added: boolean; price: number; image: string }> {
   // Parse quantity — take the first integer found, default to 1
   const qty = Math.max(1, parseInt(quantity.match(/\d+/)?.[0] ?? "1", 10) || 1);
   try {
@@ -297,21 +297,36 @@ async function addToInstacartCart(page: Page, product: ProductResult, quantity: 
       await saveScreenshot(page, `product-page-${product.name.substring(0, 15).replace(/\s/g, "_")}`);
     }
 
-    // Scrape real price from the product page
+    // Scrape real price and product image from the product page
     let scrapedPrice = product.price;
+    let scrapedImage = product.image;
     try {
-      const priceText = await page.evaluate(() => {
-        const candidates = document.querySelectorAll('[class*="price" i],[data-testid*="price" i],[aria-label*="price" i]');
-        for (const el of Array.from(candidates)) {
+      const pageData = await page.evaluate(() => {
+        // Price
+        let price: number | null = null;
+        const priceEls = document.querySelectorAll('[class*="price" i],[data-testid*="price" i],[aria-label*="price" i]');
+        for (const el of Array.from(priceEls)) {
           const text = el.textContent?.trim() ?? "";
-          const match = text.match(/\$\s*(\d+\.?\d*)/);
-          if (match) return parseFloat(match[1]);
+          const m = text.match(/\$\s*(\d+\.?\d*)/);
+          if (m) { price = parseFloat(m[1]); break; }
         }
-        return null;
+        // Image — look for the main product image
+        let image = "";
+        const imgEls = document.querySelectorAll('img[src*="instacart"],img[src*="cloudfront"],img[src*="cdn"]');
+        for (const el of Array.from(imgEls) as HTMLImageElement[]) {
+          if (el.naturalWidth > 80 && el.src && !el.src.includes("logo")) {
+            image = el.src;
+            break;
+          }
+        }
+        return { price, image };
       });
-      if (priceText && priceText > 0) {
-        scrapedPrice = priceText;
-        console.log(`Scraped real price for "${product.name}": $${scrapedPrice}`);
+      if (pageData.price && pageData.price > 0) {
+        scrapedPrice = pageData.price;
+        console.log(`Scraped price for "${product.name}": $${scrapedPrice}`);
+      }
+      if (pageData.image) {
+        scrapedImage = pageData.image;
       }
     } catch { /* non-fatal */ }
 
@@ -361,16 +376,16 @@ async function addToInstacartCart(page: Page, product: ProductResult, quantity: 
 
           await saveScreenshot(page, `after-add-${product.name.substring(0, 15).replace(/\s/g, "_")}`);
           console.log(`Added "${product.name}" (qty ${qty}) to Instacart cart`);
-          return { added: true, price: scrapedPrice };
+          return { added: true, price: scrapedPrice, image: scrapedImage };
         }
       } catch { continue; }
     }
 
     console.log(`Could not find Add button for "${product.name}"`);
-    return { added: false, price: scrapedPrice };
+    return { added: false, price: scrapedPrice, image: scrapedImage };
   } catch (err) {
     console.log(`addToInstacartCart error for "${product.name}": ${err}`);
-    return { added: false, price: product.price };
+    return { added: false, price: product.price, image: product.image };
   }
 }
 
@@ -538,19 +553,21 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
       const chosen = results[idx];
       console.log(`Picked: ${chosen.name} @ $${chosen.price} (${chosen.store})`);
 
-      // Add to the actual Instacart cart and get real price
+      // Add to the actual Instacart cart, get real price + product image
       let finalPrice = chosen.price;
+      let finalImage = chosen.image;
       if (chosen.store === "Instacart") {
-        const { added, price } = await addToInstacartCart(page, chosen, item.quantity);
+        const { added, price, image } = await addToInstacartCart(page, chosen, item.quantity);
         if (added) instacartItemsAdded++;
         if (price > 0) finalPrice = price;
+        if (image) finalImage = image;
       }
 
       selectedProducts.push({
         grocery_item_name: item.name,
         product_name: chosen.name,
         price: finalPrice,
-        image_url: chosen.image,
+        image_url: finalImage,
         product_url: chosen.url,
         store: chosen.store,
         swapped: false,
