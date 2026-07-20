@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   View, Text, TouchableOpacity, StyleSheet,
   SafeAreaView, ScrollView, Switch, Alert, ActivityIndicator
@@ -30,6 +30,11 @@ export default function Schedule() {
   const [pickingStore, setPickingStore] = useState(false)
   const [selectedStore, setSelectedStore] = useState('')
   const [runningStoreName, setRunningStoreName] = useState('')
+  const agentRunningRef = useRef(false)
+
+  useEffect(() => {
+    agentRunningRef.current = agentRunning
+  }, [agentRunning])
 
   useEffect(() => {
     loadSchedule()
@@ -37,12 +42,12 @@ export default function Schedule() {
 
   useFocusEffect(useCallback(() => {
     return () => {
-      // Reset Shop Now state when user leaves the tab
-      setCartReady(false)
-      setAgentRunning(false)
-      setPickingStore(false)
-      setSelectedStore('')
-      setRunningStoreName('')
+      if (!agentRunningRef.current) {
+        setCartReady(false)
+        setPickingStore(false)
+        setSelectedStore('')
+        setRunningStoreName('')
+      }
     }
   }, []))
 
