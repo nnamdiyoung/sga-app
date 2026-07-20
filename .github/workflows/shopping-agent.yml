@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: '0 * * * *'
   workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Force run for all users with items (skip schedule check)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 jobs:
   run-shopping-agent:
@@ -36,6 +45,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          FORCE_RUN: ${{ github.event.inputs.force_run || 'false' }}
 
       - name: Upload screenshots
         if: always()

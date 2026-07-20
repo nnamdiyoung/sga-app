@@ -74,8 +74,9 @@ async function saveScreenshot(page: Page, label: string): Promise<void> {
 }
 
 async function getUsersToShopFor(): Promise<string[]> {
+  const forceRun = process.env.FORCE_RUN === "true";
   const { hour, day } = getEasternTime(new Date());
-  console.log(`Current ET time: day=${day}, hour=${hour}`);
+  console.log(`Current ET time: day=${day}, hour=${hour}${forceRun ? " (FORCE_RUN — skipping schedule check)" : ""}`);
 
   const { data, error } = await supabase
     .from("schedules")
@@ -86,6 +87,7 @@ async function getUsersToShopFor(): Promise<string[]> {
 
   return data
     .filter((s) => {
+      if (forceRun) return true;
       const schedHour = parseInt(s.time.split(":")[0]);
       const match = s.days.includes(day) && schedHour === hour;
       console.log(`Schedule check user ${s.user_id}: days=${JSON.stringify(s.days)} time=${s.time} → ${match ? "MATCH" : "skip"}`);
