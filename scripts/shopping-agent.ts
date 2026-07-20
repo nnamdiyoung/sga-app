@@ -440,8 +440,13 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   const userEmail = authRes.data?.user?.email;
   if (!userEmail) return;
 
-  // Parse Instacart session saved from the app's WebView login
-  let sessionData: { cookies?: string; localStorage?: Record<string, string> } = {};
+  // Parse Instacart session — supports both full storageState (from script) and legacy WebView capture
+  type SessionData = {
+    storageState?: { cookies: any[]; origins: any[] };
+    cookies?: string;
+    localStorage?: Record<string, string>;
+  };
+  let sessionData: SessionData = {};
   if (profile?.instacart_session) {
     try {
       sessionData = JSON.parse(profile.instacart_session);
@@ -450,42 +455,53 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
       console.log("Could not parse instacart_session from profile.");
     }
   } else {
-    console.log("No Instacart session in profile — searches will be anonymous.");
+    console.log("No Instacart session in profile — cart additions will fail.");
   }
 
-  const context = await browser.newContext({
-    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    viewport: { width: 1280, height: 800 },
-    locale: "en-CA",
-  });
-
-  // Inject localStorage tokens
-  if (sessionData.localStorage && Object.keys(sessionData.localStorage).length > 0) {
-    await context.addInitScript((ls) => {
-      for (const [key, value] of Object.entries(ls)) {
-        try { localStorage.setItem(key, value as string); } catch {}
-      }
-    }, sessionData.localStorage);
-    console.log(`Injected ${Object.keys(sessionData.localStorage).length} localStorage entries.`);
-  }
-
-  // Inject accessible cookies
-  if (sessionData.cookies) {
-    const parsed = sessionData.cookies.split(';')
-      .map(c => {
-        const eq = c.indexOf('=');
-        if (eq === -1) return null;
-        return {
-          name: c.substring(0, eq).trim(),
-          value: c.substring(eq + 1).trim(),
-          domain: '.instacart.ca',
-          path: '/',
-        };
+  // If we have a full Playwright storageState, use it directly — it includes HttpOnly cookies
+  const context = sessionData.storageState
+    ? await browser.newContext({
+        storageState: sessionData.storageState as any,
+        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        viewport: { width: 1280, height: 800 },
+        locale: "en-CA",
       })
-      .filter((c): c is NonNullable<typeof c> => !!c?.name && !!c?.value);
-    if (parsed.length > 0) {
-      await context.addCookies(parsed);
-      console.log(`Injected ${parsed.length} cookies.`);
+    : await browser.newContext({
+        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        viewport: { width: 1280, height: 800 },
+        locale: "en-CA",
+      });
+
+  if (sessionData.storageState) {
+    console.log(`Using full storageState: ${sessionData.storageState.cookies.length} cookies (incl. HttpOnly).`);
+  } else {
+    // Legacy: inject non-HttpOnly cookies + localStorage from WebView capture
+    if (sessionData.localStorage && Object.keys(sessionData.localStorage).length > 0) {
+      await context.addInitScript((ls) => {
+        for (const [key, value] of Object.entries(ls)) {
+          try { localStorage.setItem(key, value as string); } catch {}
+        }
+      }, sessionData.localStorage);
+      console.log(`Injected ${Object.keys(sessionData.localStorage).length} localStorage entries.`);
+    }
+
+    if (sessionData.cookies) {
+      const parsed = sessionData.cookies.split(';')
+        .map(c => {
+          const eq = c.indexOf('=');
+          if (eq === -1) return null;
+          return {
+            name: c.substring(0, eq).trim(),
+            value: c.substring(eq + 1).trim(),
+            domain: '.instacart.ca',
+            path: '/',
+          };
+        })
+        .filter((c): c is NonNullable<typeof c> => !!c?.name && !!c?.value);
+      if (parsed.length > 0) {
+        await context.addCookies(parsed);
+        console.log(`Injected ${parsed.length} cookies (legacy WebView capture).`);
+      }
     }
   }
 
