@@ -31,6 +31,7 @@ export default function Schedule() {
   const [selectedStore, setSelectedStore] = useState('')
   const [runningStoreName, setRunningStoreName] = useState('')
   const agentRunningRef = useRef(false)
+  const cartChannelRef = useRef<any>(null)
 
   useEffect(() => {
     agentRunningRef.current = agentRunning
@@ -104,16 +105,21 @@ export default function Schedule() {
   }
 
   function startWatchingForCart() {
+    // Remove any existing channel to avoid duplicate error
+    if (cartChannelRef.current) {
+      supabase.removeChannel(cartChannelRef.current)
+      cartChannelRef.current = null
+    }
+
     supabase.auth.getUser().then(async ({ data: { user } }) => {
       if (!user) return
 
-      // Check if cart already exists (agent may have finished before subscription started)
-      const since = new Date(Date.now() - 30 * 60 * 1000).toISOString()
+      // Check if a pending cart already exists (agent may have finished before subscription started)
       const { data: existing } = await supabase
         .from('carts')
         .select('id')
         .eq('user_id', user.id)
-        .gte('created_at', since)
+        .eq('status', 'pending')
         .limit(1)
         .maybeSingle()
 
@@ -133,10 +139,12 @@ export default function Schedule() {
           if (payload.new.user_id === user.id) {
             setAgentRunning(false)
             setCartReady(true)
-            channel.unsubscribe()
+            supabase.removeChannel(channel)
+            cartChannelRef.current = null
           }
         })
         .subscribe()
+      cartChannelRef.current = channel
     })
   }
 
