@@ -600,6 +600,9 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
         productUrl = `https://www.instacart.ca/store/${lockedStoreSlug}/product_page/${numericId}`;
       } else if (numericId) {
         productUrl = `https://www.instacart.ca/products/${numericId}`;
+      } else if (lockedStoreSlug) {
+        // Fallback: store-specific search so WebView lands in the right store
+        productUrl = `https://www.instacart.ca/store/${lockedStoreSlug}/storefront/s?k=${encodeURIComponent(chosen.name)}`;
       }
 
       selectedProducts.push({

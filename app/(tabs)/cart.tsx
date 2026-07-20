@@ -172,14 +172,9 @@ export default function CartScreen() {
 
   function startAddToInstacart() {
     if (!cart || cart.items.length === 0) return
-    const instacartItems = cart.items.filter(
-      i => i.product_url && (
-        i.product_url.includes('/products/') ||
-        i.product_url.includes('/product_page/')
-      )
-    )
+    const instacartItems = cart.items.filter(i => !!i.product_url)
     if (instacartItems.length === 0) {
-      Alert.alert('No product links', 'Run the agent again to get direct Instacart product links.')
+      Alert.alert('No items', 'No product links found in this cart.')
       return
     }
     addedRef.current = 0
