@@ -547,11 +547,11 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   const page = await context.newPage();
 
   const selectedProducts: SelectedProduct[] = [];
-  // Use profile's preferred store if set, otherwise detect from first search redirect
-  let lockedStoreSlug = profile?.preferred_store_slug ?? "";
+  // Priority: STORE_SLUG env (Shop Now pick) → profile preferred → auto-detect
+  let lockedStoreSlug = process.env.STORE_SLUG || profile?.preferred_store_slug || "";
   let lockedStoreName = lockedStoreSlug ? slugToStoreName(lockedStoreSlug) : "Instacart";
   if (lockedStoreSlug) {
-    console.log(`Using preferred store from profile: ${lockedStoreName} (${lockedStoreSlug})`);
+    console.log(`Store locked to: ${lockedStoreName} (${lockedStoreSlug})${process.env.STORE_SLUG ? " [from Shop Now]" : " [from profile]"}`);
   }
 
   for (const item of items) {

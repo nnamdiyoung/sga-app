@@ -10,20 +10,7 @@ import { colors, spacing, radius, font } from '../../lib/theme'
 
 const DIETARY_OPTIONS = ['Vegetarian', 'Vegan', 'Halal', 'Kosher', 'Gluten-Free', 'Dairy-Free', 'Nut-Free']
 
-const INSTACART_STORES = [
-  { label: 'Walmart', slug: 'walmart' },
-  { label: 'Loblaws', slug: 'loblaw' },
-  { label: 'No Frills', slug: 'no-frills' },
-  { label: 'Metro', slug: 'metro' },
-  { label: 'Food Basics', slug: 'food-basics' },
-  { label: 'FreshCo', slug: 'freshco' },
-  { label: 'Sobeys', slug: 'sobeys' },
-  { label: 'Costco', slug: 'costco' },
-  { label: 'Adonis', slug: 'adonis' },
-  { label: 'T&T', slug: 't-and-t-supermarket' },
-  { label: 'Farm Boy', slug: 'farm-boy' },
-  { label: 'IGA', slug: 'iga' },
-]
+import { INSTACART_STORES } from '../../lib/stores'
 
 const CAPTURE_SESSION_JS = `
   (function() {

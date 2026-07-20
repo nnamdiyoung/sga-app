@@ -13,6 +13,11 @@ on:
         options:
           - 'false'
           - 'true'
+      store_slug:
+        description: 'Override store slug for this run (e.g. walmart, loblaw)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   run-shopping-agent:
@@ -46,6 +51,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           FORCE_RUN: ${{ github.event.inputs.force_run || 'false' }}
+          STORE_SLUG: ${{ github.event.inputs.store_slug || '' }}
 
       - name: Upload screenshots
         if: always()

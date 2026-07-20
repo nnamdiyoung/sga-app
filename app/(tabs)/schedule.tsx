@@ -5,6 +5,7 @@ import {
 } from 'react-native'
 import { supabase } from '../../lib/supabase'
 import { colors, spacing, radius, font } from '../../lib/theme'
+import { INSTACART_STORES, storeLabel } from '../../lib/stores'
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 const HOURS = Array.from({ length: 24 }, (_, i) => i)
@@ -25,6 +26,9 @@ export default function Schedule() {
   const [shopping, setShopping] = useState(false)
   const [agentRunning, setAgentRunning] = useState(false)
   const [cartReady, setCartReady] = useState(false)
+  const [pickingStore, setPickingStore] = useState(false)
+  const [selectedStore, setSelectedStore] = useState('')
+  const [runningStoreName, setRunningStoreName] = useState('')
 
   useEffect(() => {
     loadSchedule()
@@ -44,11 +48,19 @@ export default function Schedule() {
     }
   }
 
-  async function shopNow() {
+  async function confirmShopNow() {
+    if (!selectedStore) {
+      Alert.alert('Pick a store', 'Select which store to shop from.')
+      return
+    }
     setShopping(true)
+    setPickingStore(false)
     try {
-      const { error } = await supabase.functions.invoke('trigger-shopping-agent')
+      const { error } = await supabase.functions.invoke('trigger-shopping-agent', {
+        body: { store_slug: selectedStore },
+      })
       if (error) throw error
+      setRunningStoreName(storeLabel(selectedStore))
       setAgentRunning(true)
       setCartReady(false)
       startWatchingForCart()
@@ -56,6 +68,14 @@ export default function Schedule() {
       Alert.alert('Error', 'Could not start shopping. Please try again.')
     }
     setShopping(false)
+  }
+
+  function resetShopNow() {
+    setCartReady(false)
+    setAgentRunning(false)
+    setPickingStore(false)
+    setSelectedStore('')
+    setRunningStoreName('')
   }
 
   function startWatchingForCart() {
@@ -126,28 +146,62 @@ export default function Schedule() {
         </View>
 
         <View style={[styles.card, styles.shopNowCard]}>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.shopNowTitle}>
-              {cartReady ? '✅ Cart is ready!' : agentRunning ? '⏳ Shopping in progress...' : 'Shop Now'}
-            </Text>
-            <Text style={styles.shopNowSub}>
-              {cartReady
-                ? 'Go to the Cart tab to review and add to Instacart'
-                : agentRunning
-                ? 'Finding the best products for your list (~2 min)'
-                : 'Run SGA immediately, skipping the schedule'}
-            </Text>
-          </View>
-          {!agentRunning && !cartReady && (
-            <TouchableOpacity
-              style={[styles.shopNowBtn, shopping && styles.shopNowBtnDisabled]}
-              onPress={shopNow}
-              disabled={shopping}
-            >
-              <Text style={styles.shopNowBtnText}>{shopping ? 'Starting...' : 'Shop Now'}</Text>
-            </TouchableOpacity>
+          {cartReady ? (
+            <>
+              <Text style={styles.shopNowTitle}>✅ Cart is ready!</Text>
+              <Text style={styles.shopNowSub}>Go to the Cart tab to review and add to Instacart</Text>
+              <TouchableOpacity style={styles.shopAgainBtn} onPress={resetShopNow}>
+                <Text style={styles.shopAgainBtnText}>Shop Again</Text>
+              </TouchableOpacity>
+            </>
+          ) : agentRunning ? (
+            <View style={styles.shopNowRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.shopNowTitle}>⏳ Shopping at {runningStoreName}...</Text>
+                <Text style={styles.shopNowSub}>Finding best products (~2 min)</Text>
+              </View>
+              <ActivityIndicator color={colors.primary} />
+            </View>
+          ) : pickingStore ? (
+            <>
+              <Text style={styles.shopNowTitle}>Where should SGA shop?</Text>
+              <View style={styles.storeGrid}>
+                {INSTACART_STORES.map(store => (
+                  <TouchableOpacity
+                    key={store.slug}
+                    style={[styles.storeBtn, selectedStore === store.slug && styles.storeBtnActive]}
+                    onPress={() => setSelectedStore(store.slug)}
+                  >
+                    <Text style={[styles.storeBtnText, selectedStore === store.slug && styles.storeBtnTextActive]}>
+                      {store.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              <View style={styles.shopNowRow}>
+                <TouchableOpacity style={styles.cancelBtn} onPress={() => setPickingStore(false)}>
+                  <Text style={styles.cancelBtnText}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.shopNowBtn, { flex: 1 }, (!selectedStore || shopping) && styles.shopNowBtnDisabled]}
+                  onPress={confirmShopNow}
+                  disabled={!selectedStore || shopping}
+                >
+                  <Text style={styles.shopNowBtnText}>{shopping ? 'Starting...' : 'Start Shopping'}</Text>
+                </TouchableOpacity>
+              </View>
+            </>
+          ) : (
+            <View style={styles.shopNowRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.shopNowTitle}>Shop Now</Text>
+                <Text style={styles.shopNowSub}>Run SGA immediately, skipping the schedule</Text>
+              </View>
+              <TouchableOpacity style={styles.shopNowBtn} onPress={() => setPickingStore(true)}>
+                <Text style={styles.shopNowBtnText}>Shop Now</Text>
+              </TouchableOpacity>
+            </View>
           )}
-          {agentRunning && <ActivityIndicator color={colors.primary} />}
         </View>
 
         <View style={styles.card}>
@@ -311,12 +365,10 @@ const styles = StyleSheet.create({
   saveBtnDisabled: { opacity: 0.6 },
   saveBtnText: { color: '#fff', fontSize: font.size.md, fontWeight: '700' },
   shopNowCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
     backgroundColor: colors.primaryLight,
     borderColor: colors.primary,
   },
+  shopNowRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   shopNowTitle: { fontSize: font.size.md, fontWeight: '700', color: colors.primary },
   shopNowSub: { fontSize: font.size.xs, color: colors.textSecondary, marginTop: 2 },
   shopNowBtn: {
@@ -324,7 +376,37 @@ const styles = StyleSheet.create({
     borderRadius: radius.md,
     paddingVertical: 10,
     paddingHorizontal: spacing.md,
+    alignItems: 'center',
   },
-  shopNowBtnDisabled: { opacity: 0.6 },
+  shopNowBtnDisabled: { opacity: 0.5 },
   shopNowBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.sm },
+  shopAgainBtn: {
+    borderWidth: 1,
+    borderColor: colors.primary,
+    borderRadius: radius.md,
+    paddingVertical: 10,
+    alignItems: 'center',
+    marginTop: spacing.xs,
+  },
+  shopAgainBtnText: { color: colors.primary, fontWeight: '700', fontSize: font.size.sm },
+  storeGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
+  storeBtn: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: 8,
+    borderRadius: radius.full,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.background,
+  },
+  storeBtnActive: { backgroundColor: colors.primary, borderColor: colors.primary },
+  storeBtnText: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '500' },
+  storeBtnTextActive: { color: '#fff', fontWeight: '700' },
+  cancelBtn: {
+    paddingVertical: 10,
+    paddingHorizontal: spacing.md,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  cancelBtnText: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '600' },
 })

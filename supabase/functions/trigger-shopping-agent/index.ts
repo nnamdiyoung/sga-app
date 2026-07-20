@@ -21,6 +21,9 @@ Deno.serve(async (req) => {
     return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })
   }
 
+  const body = await req.json().catch(() => ({}))
+  const storeSlug: string = body.store_slug ?? ''
+
   const res = await fetch(
     `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${WORKFLOW_FILE}/dispatches`,
     {
@@ -30,7 +33,7 @@ Deno.serve(async (req) => {
         Accept: 'application/vnd.github.v3+json',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ ref: 'main', inputs: { force_run: 'true' } }),
+      body: JSON.stringify({ ref: 'main', inputs: { force_run: 'true', store_slug: storeSlug } }),
     }
   )
 
