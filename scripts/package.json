@@ -1,0 +1,19 @@
+{
+  "name": "sga-shopping-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "npx tsx shopping-agent.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.112",
+    "@supabase/supabase-js": "^2",
+    "playwright": "^1.40",
+    "resend": "^3",
+    "tsx": "^4"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5"
+  }
+}

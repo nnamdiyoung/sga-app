@@ -1,21 +1,27 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, TextInput, TouchableOpacity, FlatList,
-  StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform, Alert
+  StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform,
+  Alert, Animated
 } from 'react-native'
+import { Ionicons } from '@expo/vector-icons'
 import { supabase } from '../../lib/supabase'
-import { colors, spacing, radius, font } from '../../lib/theme'
+import { colors, spacing, radius, font, shadow } from '../../lib/theme'
 import type { GroceryItem } from '../../lib/types'
+
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
 export default function GroceryList() {
   const [items, setItems] = useState<GroceryItem[]>([])
   const [input, setInput] = useState('')
   const [quantity, setQuantity] = useState('')
   const [loading, setLoading] = useState(true)
+  const [nextShop, setNextShop] = useState<string | null>(null)
   const inputRef = useRef<TextInput>(null)
 
   useEffect(() => {
     fetchItems()
+    fetchNextShop()
   }, [])
 
   async function fetchItems() {
@@ -29,6 +35,29 @@ export default function GroceryList() {
       .order('added_at', { ascending: false })
     setItems(data ?? [])
     setLoading(false)
+  }
+
+  async function fetchNextShop() {
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) return
+    const { data } = await supabase
+      .from('schedules')
+      .select('days, time, active')
+      .eq('user_id', user.id)
+      .single()
+    if (!data || !data.active || !data.days?.length) return
+
+    const now = new Date()
+    const currentDay = now.getDay()
+    const sortedDays = [...data.days].sort((a, b) => a - b)
+    const next = sortedDays.find(d => d > currentDay) ?? sortedDays[0]
+    const daysUntil = next > currentDay ? next - currentDay : 7 - currentDay + next
+    const nextDate = new Date(now)
+    nextDate.setDate(now.getDate() + daysUntil)
+    const [h] = (data.time ?? '09:00').split(':')
+    const hour = parseInt(h)
+    const timeStr = hour === 0 ? '12:00 AM' : hour < 12 ? `${hour}:00 AM` : hour === 12 ? '12:00 PM' : `${hour - 12}:00 PM`
+    setNextShop(`${DAYS[next]} ${nextDate.toLocaleDateString('en-CA', { month: 'short', day: 'numeric' })} at ${timeStr}`)
   }
 
   async function addItem() {
@@ -77,13 +106,29 @@ export default function GroceryList() {
       <View style={styles.header}>
         <View>
           <Text style={styles.title}>My List</Text>
-          <Text style={styles.subtitle}>{items.length} item{items.length !== 1 ? 's' : ''}</Text>
+          {nextShop && (
+            <View style={styles.nextShopBadge}>
+              <Ionicons name="time-outline" size={12} color={colors.primary} />
+              <Text style={styles.nextShopText}>SGA shops {nextShop}</Text>
+            </View>
+          )}
         </View>
         {items.length > 0 && (
           <TouchableOpacity onPress={clearAll} style={styles.clearBtn}>
             <Text style={styles.clearBtnText}>Clear all</Text>
           </TouchableOpacity>
         )}
+      </View>
+
+      <View style={styles.statsRow}>
+        <View style={styles.statCard}>
+          <Text style={styles.statNumber}>{items.length}</Text>
+          <Text style={styles.statLabel}>Items</Text>
+        </View>
+        <View style={[styles.statCard, { backgroundColor: colors.primaryLight }]}>
+          <Ionicons name="sparkles" size={18} color={colors.primary} />
+          <Text style={[styles.statLabel, { color: colors.primary }]}>AI Ready</Text>
+        </View>
       </View>
 
       <KeyboardAvoidingView
@@ -95,20 +140,27 @@ export default function GroceryList() {
           data={items}
           keyExtractor={item => item.id}
           contentContainerStyle={styles.list}
+          showsVerticalScrollIndicator={false}
           ListEmptyComponent={
             !loading ? (
               <View style={styles.empty}>
-                <Text style={styles.emptyIcon}>🛍️</Text>
+                <View style={styles.emptyIconWrap}>
+                  <Text style={styles.emptyIcon}>🛍️</Text>
+                </View>
                 <Text style={styles.emptyTitle}>Your list is empty</Text>
-                <Text style={styles.emptyText}>Add items below and SGA will shop for you on your next scheduled run.</Text>
+                <Text style={styles.emptyText}>
+                  Add items below. SGA will find the best matches and build your cart automatically.
+                </Text>
               </View>
             ) : null
           }
-          renderItem={({ item }) => (
-            <View style={styles.item}>
+          renderItem={({ item, index }) => (
+            <View style={[styles.item, { opacity: 1 }]}>
               <View style={styles.itemLeft}>
-                <View style={styles.bullet} />
-                <View>
+                <View style={styles.itemIndex}>
+                  <Text style={styles.itemIndexText}>{index + 1}</Text>
+                </View>
+                <View style={styles.itemText}>
                   <Text style={styles.itemName}>{item.name}</Text>
                   {item.quantity !== '1' && (
                     <Text style={styles.itemQty}>Qty: {item.quantity}</Text>
@@ -116,7 +168,7 @@ export default function GroceryList() {
                 </View>
               </View>
               <TouchableOpacity onPress={() => removeItem(item.id)} style={styles.removeBtn}>
-                <Text style={styles.removeBtnText}>✕</Text>
+                <Ionicons name="close" size={14} color={colors.danger} />
               </TouchableOpacity>
             </View>
           )}
@@ -140,10 +192,9 @@ export default function GroceryList() {
               onChangeText={setQuantity}
               placeholder="Qty"
               placeholderTextColor={colors.textMuted}
-              keyboardType="default"
             />
             <TouchableOpacity style={styles.addBtn} onPress={addItem}>
-              <Text style={styles.addBtnText}>+</Text>
+              <Ionicons name="add" size={24} color="#fff" />
             </TouchableOpacity>
           </View>
         </View>
@@ -157,26 +208,91 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    alignItems: 'center',
+    alignItems: 'flex-start',
     paddingHorizontal: spacing.lg,
     paddingTop: spacing.lg,
-    paddingBottom: spacing.md,
+    paddingBottom: spacing.sm,
   },
-  title: { fontSize: font.size.xxl, fontWeight: '800', color: colors.textPrimary },
-  subtitle: { fontSize: font.size.sm, color: colors.textSecondary, marginTop: 2 },
+  title: {
+    fontSize: font.size.xxl,
+    fontWeight: '800',
+    color: colors.textPrimary,
+    letterSpacing: -0.5,
+  },
+  nextShopBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginTop: 4,
+  },
+  nextShopText: {
+    fontSize: font.size.xs,
+    color: colors.primary,
+    fontWeight: '600',
+  },
   clearBtn: {
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.xs,
     borderRadius: radius.full,
-    borderWidth: 1,
-    borderColor: colors.border,
+    backgroundColor: colors.dangerLight,
   },
-  clearBtnText: { fontSize: font.size.sm, color: colors.textSecondary },
-  list: { paddingHorizontal: spacing.lg, paddingBottom: spacing.lg },
-  empty: { alignItems: 'center', paddingTop: spacing.xxl * 2, paddingHorizontal: spacing.xl },
-  emptyIcon: { fontSize: 48, marginBottom: spacing.md },
-  emptyTitle: { fontSize: font.size.lg, fontWeight: '700', color: colors.textPrimary, marginBottom: spacing.sm },
-  emptyText: { fontSize: font.size.sm, color: colors.textSecondary, textAlign: 'center', lineHeight: 20 },
+  clearBtnText: { fontSize: font.size.sm, color: colors.danger, fontWeight: '600' },
+  statsRow: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+    paddingHorizontal: spacing.lg,
+    paddingBottom: spacing.md,
+  },
+  statCard: {
+    flex: 1,
+    backgroundColor: colors.card,
+    borderRadius: radius.md,
+    padding: spacing.md,
+    alignItems: 'center',
+    gap: 2,
+    ...shadow.sm,
+  },
+  statNumber: {
+    fontSize: font.size.xl,
+    fontWeight: '800',
+    color: colors.textPrimary,
+  },
+  statLabel: {
+    fontSize: font.size.xs,
+    color: colors.textSecondary,
+    fontWeight: '600',
+  },
+  list: {
+    paddingHorizontal: spacing.lg,
+    paddingBottom: spacing.lg,
+    gap: spacing.sm,
+  },
+  empty: {
+    alignItems: 'center',
+    paddingTop: spacing.xxl * 1.5,
+    paddingHorizontal: spacing.xl,
+    gap: spacing.md,
+  },
+  emptyIconWrap: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: colors.primaryLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  emptyIcon: { fontSize: 36 },
+  emptyTitle: {
+    fontSize: font.size.lg,
+    fontWeight: '700',
+    color: colors.textPrimary,
+  },
+  emptyText: {
+    fontSize: font.size.sm,
+    color: colors.textSecondary,
+    textAlign: 'center',
+    lineHeight: 20,
+  },
   item: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -185,18 +301,20 @@ const styles = StyleSheet.create({
     borderRadius: radius.md,
     paddingHorizontal: spacing.md,
     paddingVertical: 14,
-    marginBottom: spacing.sm,
-    borderWidth: 1,
-    borderColor: colors.border,
+    ...shadow.sm,
   },
   itemLeft: { flexDirection: 'row', alignItems: 'center', gap: spacing.md, flex: 1 },
-  bullet: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: colors.primary,
+  itemIndex: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: colors.primaryLight,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  itemName: { fontSize: font.size.md, color: colors.textPrimary, fontWeight: '500' },
+  itemIndexText: { fontSize: font.size.xs, fontWeight: '700', color: colors.primary },
+  itemText: { flex: 1 },
+  itemName: { fontSize: font.size.md, color: colors.textPrimary, fontWeight: '600' },
   itemQty: { fontSize: font.size.xs, color: colors.textSecondary, marginTop: 2 },
   removeBtn: {
     width: 28,
@@ -206,12 +324,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  removeBtnText: { fontSize: font.size.xs, color: colors.danger, fontWeight: '700' },
   inputArea: {
     backgroundColor: colors.card,
     borderTopWidth: 1,
     borderTopColor: colors.border,
     padding: spacing.md,
+    ...shadow.md,
   },
   inputRow: { flexDirection: 'row', gap: spacing.sm, alignItems: 'center' },
   itemInput: {
@@ -238,12 +356,12 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   addBtn: {
-    width: 44,
-    height: 44,
+    width: 46,
+    height: 46,
     borderRadius: radius.md,
     backgroundColor: colors.primary,
     alignItems: 'center',
     justifyContent: 'center',
+    ...shadow.sm,
   },
-  addBtnText: { color: '#fff', fontSize: 24, fontWeight: '300', lineHeight: 28 },
 })

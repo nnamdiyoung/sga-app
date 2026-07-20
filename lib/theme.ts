@@ -1,18 +1,38 @@
 export const colors = {
   primary: '#16A34A',
   primaryLight: '#DCFCE7',
+  primaryMid: '#86EFAC',
   primaryDark: '#15803D',
-  background: '#F9FAFB',
+  background: '#F2F4F7',
   card: '#FFFFFF',
-  textPrimary: '#111827',
-  textSecondary: '#6B7280',
+  textPrimary: '#0D1117',
+  textSecondary: '#5C6370',
   textMuted: '#9CA3AF',
-  border: '#E5E7EB',
+  border: '#E8EBF0',
   danger: '#EF4444',
   dangerLight: '#FEE2E2',
   warning: '#F59E0B',
   warningLight: '#FEF3C7',
   success: '#16A34A',
+  accent: '#7C3AED',
+  accentLight: '#EDE9FE',
+}
+
+export const shadow = {
+  sm: {
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.06,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+  md: {
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.08,
+    shadowRadius: 12,
+    elevation: 4,
+  },
 }
 
 export const spacing = {

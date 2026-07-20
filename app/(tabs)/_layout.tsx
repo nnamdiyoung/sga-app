@@ -1,13 +1,16 @@
 import { Tabs } from 'expo-router'
-import { View, Text, StyleSheet } from 'react-native'
-import { colors, font } from '../../lib/theme'
+import { Ionicons } from '@expo/vector-icons'
+import { colors } from '../../lib/theme'
 
-function TabIcon({ icon, label, focused }: { icon: string; label: string; focused: boolean }) {
+type IoniconsName = React.ComponentProps<typeof Ionicons>['name']
+
+function icon(focused: boolean, active: IoniconsName, inactive: IoniconsName) {
   return (
-    <View style={styles.tabItem}>
-      <Text style={[styles.icon, focused && styles.iconFocused]}>{icon}</Text>
-      <Text style={[styles.label, focused && styles.labelFocused]}>{label}</Text>
-    </View>
+    <Ionicons
+      name={focused ? active : inactive}
+      size={24}
+      color={focused ? colors.primary : colors.textMuted}
+    />
   )
 }
 
@@ -16,50 +19,51 @@ export default function TabsLayout() {
     <Tabs
       screenOptions={{
         headerShown: false,
-        tabBarStyle: styles.tabBar,
-        tabBarShowLabel: false,
+        tabBarStyle: {
+          backgroundColor: colors.card,
+          borderTopColor: colors.border,
+          borderTopWidth: 1,
+          height: 72,
+          paddingBottom: 12,
+          paddingTop: 8,
+        },
+        tabBarActiveTintColor: colors.primary,
+        tabBarInactiveTintColor: colors.textMuted,
+        tabBarLabelStyle: {
+          fontSize: 11,
+          fontWeight: '600',
+          marginTop: 2,
+        },
       }}
     >
       <Tabs.Screen
         name="index"
         options={{
-          tabBarIcon: ({ focused }) => <TabIcon icon="📝" label="List" focused={focused} />,
+          title: 'List',
+          tabBarIcon: ({ focused }) => icon(focused, 'list', 'list-outline'),
         }}
       />
       <Tabs.Screen
         name="cart"
         options={{
-          tabBarIcon: ({ focused }) => <TabIcon icon="🛒" label="Cart" focused={focused} />,
+          title: 'Cart',
+          tabBarIcon: ({ focused }) => icon(focused, 'cart', 'cart-outline'),
         }}
       />
       <Tabs.Screen
         name="schedule"
         options={{
-          tabBarIcon: ({ focused }) => <TabIcon icon="📅" label="Schedule" focused={focused} />,
+          title: 'Schedule',
+          tabBarIcon: ({ focused }) => icon(focused, 'calendar', 'calendar-outline'),
         }}
       />
       <Tabs.Screen
         name="profile"
         options={{
-          tabBarIcon: ({ focused }) => <TabIcon icon="👤" label="Profile" focused={focused} />,
+          title: 'Profile',
+          tabBarIcon: ({ focused }) => icon(focused, 'person', 'person-outline'),
         }}
       />
     </Tabs>
   )
 }
-
-const styles = StyleSheet.create({
-  tabBar: {
-    backgroundColor: colors.card,
-    borderTopColor: colors.border,
-    borderTopWidth: 1,
-    height: 80,
-    paddingBottom: 16,
-    paddingTop: 8,
-  },
-  tabItem: { alignItems: 'center', gap: 2 },
-  icon: { fontSize: 22, opacity: 0.4 },
-  iconFocused: { opacity: 1 },
-  label: { fontSize: font.size.xs, color: colors.textMuted, fontWeight: '500' },
-  labelFocused: { color: colors.primary, fontWeight: '700' },
-})
