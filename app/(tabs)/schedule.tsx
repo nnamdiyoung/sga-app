@@ -114,16 +114,16 @@ export default function Schedule() {
     supabase.auth.getUser().then(async ({ data: { user } }) => {
       if (!user) return
 
-      // Check if a pending cart already exists (agent may have finished before subscription started)
+      // Check if a cart with actual items exists (agent may have finished before subscription started)
       const { data: existing } = await supabase
         .from('carts')
-        .select('id')
+        .select('id, cart_items(id)')
         .eq('user_id', user.id)
         .eq('status', 'pending')
         .limit(1)
         .maybeSingle()
 
-      if (existing) {
+      if (existing && (existing as any).cart_items?.length > 0) {
         setAgentRunning(false)
         setCartReady(true)
         return
