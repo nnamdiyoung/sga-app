@@ -59,6 +59,7 @@ create table if not exists cart_items (
 -- ALTER TABLE cart_items ADD COLUMN IF NOT EXISTS quantity TEXT DEFAULT '1';
 -- ALTER TABLE profiles ADD COLUMN IF NOT EXISTS instacart_session TEXT DEFAULT '';
 -- ALTER TABLE profiles ADD COLUMN IF NOT EXISTS github_token TEXT DEFAULT '';
+-- ALTER TABLE profiles ADD COLUMN IF NOT EXISTS preferred_store_slug TEXT DEFAULT '';
 
 -- Row Level Security
 alter table profiles enable row level security;

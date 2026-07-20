@@ -23,6 +23,7 @@ interface Profile {
   instacart_email: string;
   instacart_password: string;
   instacart_session: string;
+  preferred_store_slug?: string;
 }
 
 interface GroceryItem {
@@ -546,8 +547,12 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   const page = await context.newPage();
 
   const selectedProducts: SelectedProduct[] = [];
-  let lockedStoreSlug = "";
-  let lockedStoreName = "Instacart";
+  // Use profile's preferred store if set, otherwise detect from first search redirect
+  let lockedStoreSlug = profile?.preferred_store_slug ?? "";
+  let lockedStoreName = lockedStoreSlug ? slugToStoreName(lockedStoreSlug) : "Instacart";
+  if (lockedStoreSlug) {
+    console.log(`Using preferred store from profile: ${lockedStoreName} (${lockedStoreSlug})`);
+  }
 
   for (const item of items) {
     console.log(`\n--- Shopping for: ${item.name} ---`);

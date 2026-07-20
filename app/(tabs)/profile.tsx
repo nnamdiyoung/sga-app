@@ -10,6 +10,21 @@ import { colors, spacing, radius, font } from '../../lib/theme'
 
 const DIETARY_OPTIONS = ['Vegetarian', 'Vegan', 'Halal', 'Kosher', 'Gluten-Free', 'Dairy-Free', 'Nut-Free']
 
+const INSTACART_STORES = [
+  { label: 'Walmart', slug: 'walmart' },
+  { label: 'Loblaws', slug: 'loblaw' },
+  { label: 'No Frills', slug: 'no-frills' },
+  { label: 'Metro', slug: 'metro' },
+  { label: 'Food Basics', slug: 'food-basics' },
+  { label: 'FreshCo', slug: 'freshco' },
+  { label: 'Sobeys', slug: 'sobeys' },
+  { label: 'Costco', slug: 'costco' },
+  { label: 'Adonis', slug: 'adonis' },
+  { label: 'T&T', slug: 't-and-t-supermarket' },
+  { label: 'Farm Boy', slug: 'farm-boy' },
+  { label: 'IGA', slug: 'iga' },
+]
+
 const CAPTURE_SESSION_JS = `
   (function() {
     try {
@@ -39,6 +54,7 @@ export default function Profile() {
   const [saving, setSaving] = useState(false)
   const [profileId, setProfileId] = useState<string | null>(null)
   const [email, setEmail] = useState('')
+  const [preferredStore, setPreferredStore] = useState('')
   const [instacartConnected, setInstacartConnected] = useState(false)
   const [showWebView, setShowWebView] = useState(false)
   const [webViewReady, setWebViewReady] = useState(false)
@@ -67,6 +83,7 @@ export default function Profile() {
       setDietary(data.dietary ?? [])
       setAllergies(data.allergies ?? [])
       setBrands(data.brands ?? [])
+      setPreferredStore(data.preferred_store_slug ?? '')
       setInstacartConnected(!!data.instacart_session)
     }
   }
@@ -102,6 +119,7 @@ export default function Profile() {
       dietary,
       allergies,
       brands,
+      preferred_store_slug: preferredStore,
     }
 
     if (profileId) {
@@ -295,6 +313,27 @@ export default function Profile() {
               <Text style={styles.addTagBtnText}>Add</Text>
             </TouchableOpacity>
           </View>
+        </View>
+
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Preferred Store</Text>
+          <Text style={styles.cardSubtitle}>SGA will shop from this store on Instacart</Text>
+          <View style={styles.tagsWrap}>
+            {INSTACART_STORES.map(store => (
+              <TouchableOpacity
+                key={store.slug}
+                style={[styles.tag, preferredStore === store.slug && styles.tagActive]}
+                onPress={() => setPreferredStore(store.slug)}
+              >
+                <Text style={[styles.tagText, preferredStore === store.slug && styles.tagTextActive]}>
+                  {store.label}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+          {!preferredStore && (
+            <Text style={styles.secureNote}>Pick your store so the agent searches in the right place</Text>
+          )}
         </View>
 
         <View style={styles.card}>
