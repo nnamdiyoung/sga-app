@@ -51,8 +51,13 @@ create table if not exists cart_items (
   image_url text default '',
   product_url text default '',
   store text default '',
-  swapped boolean default false
+  swapped boolean default false,
+  quantity text default '1'
 );
+
+-- Migration for existing databases (run if table already exists):
+-- ALTER TABLE cart_items ADD COLUMN IF NOT EXISTS quantity TEXT DEFAULT '1';
+-- ALTER TABLE profiles ADD COLUMN IF NOT EXISTS instacart_session TEXT DEFAULT '';
 
 -- Row Level Security
 alter table profiles enable row level security;

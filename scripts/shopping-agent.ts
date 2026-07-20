@@ -48,6 +48,7 @@ interface SelectedProduct {
   product_url: string;
   store: string;
   swapped: boolean;
+  quantity: string;
 }
 
 function isEasternDST(date: Date): boolean {
@@ -546,6 +547,7 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
         product_url: `https://www.instacart.ca/store/s?k=${encodeURIComponent(item.name)}`,
         store: "Instacart",
         swapped: false,
+        quantity: item.quantity,
       });
     } else {
       const idx = await pickBestProduct(item.name, item.quantity, results, profile);
@@ -569,6 +571,7 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
         product_url: productUrl,
         store: chosen.store,
         swapped: false,
+        quantity: item.quantity,
       });
     }
 

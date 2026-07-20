@@ -38,6 +38,7 @@ export type CartItem = {
   product_url: string
   store: string
   swapped: boolean
+  quantity?: string
 }
 
 export type UserProfile = {
