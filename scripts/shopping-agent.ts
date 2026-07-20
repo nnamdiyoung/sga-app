@@ -22,6 +22,7 @@ interface Profile {
   brands: string;
   instacart_email: string;
   instacart_password: string;
+  instacart_session: string;
 }
 
 interface GroceryItem {
@@ -311,26 +312,55 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   const userEmail = authRes.data?.user?.email;
   if (!userEmail) return;
 
-  // Load saved Instacart session from GitHub secret (captured once via capture-session.ts)
-  let storageState: any = undefined;
-  const sessionB64 = process.env.INSTACART_SESSION;
-  if (sessionB64) {
+  // Parse Instacart session saved from the app's WebView login
+  let sessionData: { cookies?: string; localStorage?: Record<string, string> } = {};
+  if (profile?.instacart_session) {
     try {
-      storageState = JSON.parse(Buffer.from(sessionB64, "base64").toString("utf-8"));
-      console.log("Loaded Instacart session from INSTACART_SESSION secret.");
+      sessionData = JSON.parse(profile.instacart_session);
+      console.log("Loaded Instacart session from user profile.");
     } catch {
-      console.log("Failed to parse INSTACART_SESSION — proceeding without session.");
+      console.log("Could not parse instacart_session from profile.");
     }
   } else {
-    console.log("No INSTACART_SESSION secret found — searches will be anonymous.");
+    console.log("No Instacart session in profile — searches will be anonymous.");
   }
 
   const context = await browser.newContext({
     userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     viewport: { width: 1280, height: 800 },
     locale: "en-CA",
-    storageState,
   });
+
+  // Inject localStorage tokens
+  if (sessionData.localStorage && Object.keys(sessionData.localStorage).length > 0) {
+    await context.addInitScript((ls) => {
+      for (const [key, value] of Object.entries(ls)) {
+        try { localStorage.setItem(key, value as string); } catch {}
+      }
+    }, sessionData.localStorage);
+    console.log(`Injected ${Object.keys(sessionData.localStorage).length} localStorage entries.`);
+  }
+
+  // Inject accessible cookies
+  if (sessionData.cookies) {
+    const parsed = sessionData.cookies.split(';')
+      .map(c => {
+        const eq = c.indexOf('=');
+        if (eq === -1) return null;
+        return {
+          name: c.substring(0, eq).trim(),
+          value: c.substring(eq + 1).trim(),
+          domain: '.instacart.ca',
+          path: '/',
+        };
+      })
+      .filter((c): c is NonNullable<typeof c> => !!c?.name && !!c?.value);
+    if (parsed.length > 0) {
+      await context.addCookies(parsed);
+      console.log(`Injected ${parsed.length} cookies.`);
+    }
+  }
+
   const page = await context.newPage();
 
   const selectedProducts: SelectedProduct[] = [];

@@ -1,12 +1,33 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, TextInput, TouchableOpacity, ScrollView,
-  StyleSheet, SafeAreaView, Alert, Switch
+  StyleSheet, SafeAreaView, Alert, Modal, ActivityIndicator
 } from 'react-native'
+import { WebView } from 'react-native-webview'
+import type { WebView as WebViewType } from 'react-native-webview'
 import { supabase } from '../../lib/supabase'
 import { colors, spacing, radius, font } from '../../lib/theme'
 
 const DIETARY_OPTIONS = ['Vegetarian', 'Vegan', 'Halal', 'Kosher', 'Gluten-Free', 'Dairy-Free', 'Nut-Free']
+
+const CAPTURE_SESSION_JS = `
+  (function() {
+    try {
+      var ls = {};
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        if (k) ls[k] = localStorage.getItem(k);
+      }
+      window.ReactNativeWebView.postMessage(JSON.stringify({
+        cookies: document.cookie,
+        localStorage: ls
+      }));
+    } catch(e) {
+      window.ReactNativeWebView.postMessage(JSON.stringify({ error: String(e) }));
+    }
+  })();
+  true;
+`
 
 export default function Profile() {
   const [budget, setBudget] = useState('')
@@ -15,12 +36,15 @@ export default function Profile() {
   const [allergies, setAllergies] = useState<string[]>([])
   const [brandInput, setBrandInput] = useState('')
   const [brands, setBrands] = useState<string[]>([])
-  const [instacartEmail, setInstacartEmail] = useState('')
-  const [instacartPassword, setInstacartPassword] = useState('')
-  const [showPassword, setShowPassword] = useState(false)
   const [saving, setSaving] = useState(false)
   const [profileId, setProfileId] = useState<string | null>(null)
   const [email, setEmail] = useState('')
+  const [instacartConnected, setInstacartConnected] = useState(false)
+  const [showWebView, setShowWebView] = useState(false)
+  const [webViewReady, setWebViewReady] = useState(false)
+  const [capturingSession, setCapturingSession] = useState(false)
+  const webViewRef = useRef<WebViewType>(null)
+  const capturedRef = useRef(false)
 
   useEffect(() => {
     loadProfile()
@@ -43,8 +67,7 @@ export default function Profile() {
       setDietary(data.dietary ?? [])
       setAllergies(data.allergies ?? [])
       setBrands(data.brands ?? [])
-      setInstacartEmail(data.instacart_email ?? '')
-      setInstacartPassword(data.instacart_password ?? '')
+      setInstacartConnected(!!data.instacart_session)
     }
   }
 
@@ -79,8 +102,6 @@ export default function Profile() {
       dietary,
       allergies,
       brands,
-      instacart_email: instacartEmail,
-      instacart_password: instacartPassword,
     }
 
     if (profileId) {
@@ -92,6 +113,80 @@ export default function Profile() {
 
     setSaving(false)
     Alert.alert('Saved', 'Your profile has been updated.')
+  }
+
+  function openInstacartConnect() {
+    capturedRef.current = false
+    setWebViewReady(false)
+    setCapturingSession(false)
+    setShowWebView(true)
+  }
+
+  function handleWebViewNavigation(navState: { url: string }) {
+    const url = navState.url || ''
+    // User has left the login/oauth pages — they're logged in
+    const isLoggedIn =
+      url.includes('instacart.ca') &&
+      !url.includes('/login') &&
+      !url.includes('accounts.google.com') &&
+      !url.includes('appleid.apple.com') &&
+      !url.includes('facebook.com')
+
+    if (isLoggedIn && webViewReady && !capturedRef.current) {
+      capturedRef.current = true
+      setCapturingSession(true)
+      webViewRef.current?.injectJavaScript(CAPTURE_SESSION_JS)
+    }
+  }
+
+  async function handleWebViewMessage(event: { nativeEvent: { data: string } }) {
+    try {
+      const data = JSON.parse(event.nativeEvent.data)
+      if (data.error) {
+        setCapturingSession(false)
+        Alert.alert('Error', 'Could not capture session. Please try again.')
+        return
+      }
+
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) return
+
+      const sessionJson = JSON.stringify({
+        cookies: data.cookies ?? '',
+        localStorage: data.localStorage ?? {},
+      })
+
+      const updatePayload = { instacart_session: sessionJson }
+      if (profileId) {
+        await supabase.from('profiles').update(updatePayload).eq('id', profileId)
+      } else {
+        await supabase.from('profiles').upsert({ user_id: user.id, ...updatePayload })
+      }
+
+      setInstacartConnected(true)
+      setCapturingSession(false)
+      setShowWebView(false)
+      Alert.alert('Connected!', 'Your Instacart account is now linked. The agent will use it for your next shopping run.')
+    } catch {
+      setCapturingSession(false)
+      Alert.alert('Error', 'Failed to save session. Please try again.')
+    }
+  }
+
+  async function disconnectInstacart() {
+    Alert.alert('Disconnect Instacart', 'Remove your Instacart session?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Disconnect',
+        style: 'destructive',
+        onPress: async () => {
+          if (profileId) {
+            await supabase.from('profiles').update({ instacart_session: '' }).eq('id', profileId)
+          }
+          setInstacartConnected(false)
+        }
+      }
+    ])
   }
 
   async function handleSignOut() {
@@ -204,30 +299,23 @@ export default function Profile() {
 
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Instacart Account</Text>
-          <Text style={styles.cardSubtitle}>Used by the AI agent to shop on your behalf</Text>
-          <TextInput
-            style={styles.input}
-            value={instacartEmail}
-            onChangeText={setInstacartEmail}
-            placeholder="Instacart email"
-            placeholderTextColor={colors.textMuted}
-            keyboardType="email-address"
-            autoCapitalize="none"
-          />
-          <View style={styles.passwordRow}>
-            <TextInput
-              style={[styles.input, { flex: 1 }]}
-              value={instacartPassword}
-              onChangeText={setInstacartPassword}
-              placeholder="Instacart password"
-              placeholderTextColor={colors.textMuted}
-              secureTextEntry={!showPassword}
-            />
-            <TouchableOpacity onPress={() => setShowPassword(p => !p)} style={styles.showBtn}>
-              <Text style={styles.showBtnText}>{showPassword ? 'Hide' : 'Show'}</Text>
+          <Text style={styles.cardSubtitle}>Connect your account so the AI agent can shop on your behalf</Text>
+          {instacartConnected ? (
+            <View style={styles.connectedRow}>
+              <View style={styles.connectedBadge}>
+                <View style={styles.connectedDot} />
+                <Text style={styles.connectedText}>Connected</Text>
+              </View>
+              <TouchableOpacity onPress={disconnectInstacart}>
+                <Text style={styles.disconnectText}>Disconnect</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <TouchableOpacity style={styles.connectBtn} onPress={openInstacartConnect}>
+              <Text style={styles.connectBtnText}>Connect Instacart Account</Text>
             </TouchableOpacity>
-          </View>
-          <Text style={styles.secureNote}>🔒 Stored securely and only used for automated shopping</Text>
+          )}
+          <Text style={styles.secureNote}>Your session is encrypted and only used by the shopping agent</Text>
         </View>
 
         <TouchableOpacity
@@ -242,6 +330,44 @@ export default function Profile() {
           <Text style={styles.signOutText}>Sign Out</Text>
         </TouchableOpacity>
       </ScrollView>
+
+      <Modal visible={showWebView} animationType="slide" presentationStyle="fullScreen">
+        <SafeAreaView style={styles.modalContainer}>
+          <View style={styles.modalHeader}>
+            <View>
+              <Text style={styles.modalTitle}>Connect Instacart</Text>
+              <Text style={styles.modalSubtitle}>Log in with your Instacart account</Text>
+            </View>
+            <TouchableOpacity
+              style={styles.modalCloseBtn}
+              onPress={() => setShowWebView(false)}
+            >
+              <Text style={styles.modalCloseBtnText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+
+          {capturingSession && (
+            <View style={styles.capturingOverlay}>
+              <ActivityIndicator size="large" color={colors.primary} />
+              <Text style={styles.capturingText}>Saving your session...</Text>
+            </View>
+          )}
+
+          <WebView
+            ref={webViewRef}
+            source={{ uri: 'https://www.instacart.ca/login' }}
+            style={styles.webView}
+            onLoad={() => setWebViewReady(true)}
+            onNavigationStateChange={handleWebViewNavigation}
+            onMessage={handleWebViewMessage}
+            javaScriptEnabled
+            domStorageEnabled
+            sharedCookiesEnabled
+            thirdPartyCookiesEnabled
+            userAgent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+          />
+        </SafeAreaView>
+      </Modal>
     </SafeAreaView>
   )
 }
@@ -309,26 +435,31 @@ const styles = StyleSheet.create({
     borderRadius: radius.md,
   },
   addTagBtnText: { color: '#fff', fontWeight: '600', fontSize: font.size.sm },
-  input: {
-    backgroundColor: colors.background,
-    borderWidth: 1,
-    borderColor: colors.border,
+  connectedRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: colors.primaryLight,
     borderRadius: radius.md,
     paddingHorizontal: spacing.md,
     paddingVertical: 12,
-    fontSize: font.size.sm,
-    color: colors.textPrimary,
   },
-  passwordRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
-  showBtn: {
-    paddingHorizontal: spacing.md,
-    paddingVertical: 12,
-    backgroundColor: colors.background,
-    borderWidth: 1,
-    borderColor: colors.border,
+  connectedBadge: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  connectedDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: colors.primary,
+  },
+  connectedText: { fontSize: font.size.sm, fontWeight: '600', color: colors.primary },
+  disconnectText: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '500' },
+  connectBtn: {
+    backgroundColor: colors.primary,
     borderRadius: radius.md,
+    paddingVertical: 13,
+    alignItems: 'center',
   },
-  showBtnText: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '600' },
+  connectBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.sm },
   secureNote: { fontSize: font.size.xs, color: colors.textMuted },
   saveBtn: {
     backgroundColor: colors.primary,
@@ -347,4 +478,39 @@ const styles = StyleSheet.create({
     marginBottom: spacing.xl,
   },
   signOutText: { fontSize: font.size.md, color: colors.textSecondary, fontWeight: '600' },
+  modalContainer: { flex: 1, backgroundColor: colors.background },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    backgroundColor: colors.card,
+  },
+  modalTitle: { fontSize: font.size.md, fontWeight: '700', color: colors.textPrimary },
+  modalSubtitle: { fontSize: font.size.xs, color: colors.textSecondary, marginTop: 2 },
+  modalCloseBtn: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: 8,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  modalCloseBtnText: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '600' },
+  webView: { flex: 1 },
+  capturingOverlay: {
+    position: 'absolute',
+    top: 80,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    zIndex: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.md,
+  },
+  capturingText: { fontSize: font.size.md, color: colors.textPrimary, fontWeight: '600' },
 })
