@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import {
   View, Text, TouchableOpacity, StyleSheet,
   SafeAreaView, ScrollView, Switch, Alert, ActivityIndicator
@@ -6,6 +6,7 @@ import {
 import { supabase } from '../../lib/supabase'
 import { colors, spacing, radius, font } from '../../lib/theme'
 import { INSTACART_STORES, storeLabel } from '../../lib/stores'
+import { useFocusEffect } from '@react-navigation/native'
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 const HOURS = Array.from({ length: 24 }, (_, i) => i)
@@ -33,6 +34,17 @@ export default function Schedule() {
   useEffect(() => {
     loadSchedule()
   }, [])
+
+  useFocusEffect(useCallback(() => {
+    return () => {
+      // Reset Shop Now state when user leaves the tab
+      setCartReady(false)
+      setAgentRunning(false)
+      setPickingStore(false)
+      setSelectedStore('')
+      setRunningStoreName('')
+    }
+  }, []))
 
   async function loadSchedule() {
     const { data: { user } } = await supabase.auth.getUser()
@@ -70,15 +82,7 @@ export default function Schedule() {
     setShopping(false)
   }
 
-  function resetShopNow() {
-    setCartReady(false)
-    setAgentRunning(false)
-    setPickingStore(false)
-    setSelectedStore('')
-    setRunningStoreName('')
-  }
-
-  function startWatchingForCart() {
+function startWatchingForCart() {
     supabase.auth.getUser().then(({ data: { user } }) => {
       if (!user) return
       const channel = supabase
@@ -150,9 +154,6 @@ export default function Schedule() {
             <>
               <Text style={styles.shopNowTitle}>✅ Cart is ready!</Text>
               <Text style={styles.shopNowSub}>Go to the Cart tab to review and add to Instacart</Text>
-              <TouchableOpacity style={styles.shopAgainBtn} onPress={resetShopNow}>
-                <Text style={styles.shopAgainBtnText}>Shop Again</Text>
-              </TouchableOpacity>
             </>
           ) : agentRunning ? (
             <View style={styles.shopNowRow}>
@@ -380,15 +381,6 @@ const styles = StyleSheet.create({
   },
   shopNowBtnDisabled: { opacity: 0.5 },
   shopNowBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.sm },
-  shopAgainBtn: {
-    borderWidth: 1,
-    borderColor: colors.primary,
-    borderRadius: radius.md,
-    paddingVertical: 10,
-    alignItems: 'center',
-    marginTop: spacing.xs,
-  },
-  shopAgainBtnText: { color: colors.primary, fontWeight: '700', fontSize: font.size.sm },
   storeGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
   storeBtn: {
     paddingHorizontal: spacing.md,
