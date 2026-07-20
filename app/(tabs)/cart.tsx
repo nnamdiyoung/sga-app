@@ -9,16 +9,20 @@ import { supabase } from '../../lib/supabase'
 import { colors, spacing, radius, font } from '../../lib/theme'
 import type { Cart, CartItem } from '../../lib/types'
 
-// Injected after page settles — grabs OG image and clicks the Add button
+// Injected after page settles — grabs OG image, reports page state, clicks Add button
 const INJECT_JS = `
 (function() {
-  // Grab the OG image for display in the app
   var ogImg = '';
   var metaOg = document.querySelector('meta[property="og:image"]');
   if (metaOg) ogImg = metaOg.getAttribute('content') || '';
 
-  // Try every reasonable selector for the Add to cart button
   var clicked = false;
+  var allBtns = Array.from(document.querySelectorAll('button, [role="button"]'));
+  var btnTexts = allBtns.slice(0, 20).map(function(b) {
+    return (b.getAttribute('aria-label') || b.textContent || '').replace(/\\s+/g, ' ').trim().substring(0, 40);
+  });
+
+  // Try data-testid selectors first
   var candidates = [
     '[data-testid="add-item-to-cart-button"]',
     '[data-testid*="add_to_cart"]',
@@ -30,17 +34,12 @@ const INJECT_JS = `
   }
 
   if (!clicked) {
-    // aria-label approach
-    var allBtns = Array.from(document.querySelectorAll('button, [role="button"]'));
     for (var btn of allBtns) {
       var lbl = (btn.getAttribute('aria-label') || '').toLowerCase();
       var txt = (btn.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
       if (
-        lbl.includes('add to cart') ||
-        lbl.includes('add item') ||
-        txt === 'add to cart' ||
-        txt === 'add item' ||
-        txt === 'add'
+        lbl.includes('add to cart') || lbl.includes('add item') ||
+        txt === 'add to cart' || txt === 'add item' || txt === 'add'
       ) {
         btn.click();
         clicked = true;
@@ -49,7 +48,13 @@ const INJECT_JS = `
     }
   }
 
-  window.ReactNativeWebView.postMessage(JSON.stringify({ clicked: clicked, image: ogImg }));
+  window.ReactNativeWebView.postMessage(JSON.stringify({
+    clicked: clicked,
+    image: ogImg,
+    url: window.location.href,
+    title: document.title,
+    btnTexts: btnTexts
+  }));
 })();
 true;
 `
@@ -130,6 +135,7 @@ export default function CartScreen() {
   async function handleWebViewMessage(event: { nativeEvent: { data: string } }) {
     try {
       const data = JSON.parse(event.nativeEvent.data)
+      console.log('[SGA] WebView msg:', JSON.stringify(data))
 
       // Save the OG image back to Supabase for this cart item
       const currentItem = queueRef.current[indexRef.current]
@@ -275,7 +281,7 @@ export default function CartScreen() {
           </View>
 
           {addStatus === 'adding' ? (
-            <View style={styles.progressOverlay}>
+            <View style={[styles.progressOverlay, { zIndex: 10 }]}>
               <ActivityIndicator size="large" color={colors.primary} />
               <Text style={styles.progressTitle}>
                 Adding {currentItem?.grocery_item_name}...
@@ -308,20 +314,22 @@ export default function CartScreen() {
             </View>
           )}
 
-          {/* Hidden WebView doing the work */}
+          {/* WebView — full size so the SPA renders properly, overlay sits on top */}
           {addStatus === 'adding' && currentItem?.product_url && (
-            <WebView
-              ref={webViewRef}
-              source={{ uri: currentItem.product_url }}
-              style={styles.hiddenWebView}
-              onLoad={handleWebViewLoad}
-              onMessage={handleWebViewMessage}
-              javaScriptEnabled
-              domStorageEnabled
-              sharedCookiesEnabled
-              thirdPartyCookiesEnabled
-              userAgent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            />
+            <View style={StyleSheet.absoluteFillObject}>
+              <WebView
+                ref={webViewRef}
+                source={{ uri: currentItem.product_url }}
+                style={{ flex: 1 }}
+                onLoad={handleWebViewLoad}
+                onMessage={handleWebViewMessage}
+                javaScriptEnabled
+                domStorageEnabled
+                sharedCookiesEnabled
+                thirdPartyCookiesEnabled
+                userAgent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+              />
+            </View>
           )}
         </SafeAreaView>
       </Modal>
@@ -425,11 +433,14 @@ const styles = StyleSheet.create({
   modalTitle: { fontSize: font.size.md, fontWeight: '700', color: colors.textPrimary },
   modalSubtitle: { fontSize: font.size.xs, color: colors.textSecondary, marginTop: 2 },
   progressOverlay: {
-    flex: 1,
+    position: 'absolute',
+    top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: colors.background,
     alignItems: 'center',
     justifyContent: 'center',
     padding: spacing.xl,
     gap: spacing.md,
+    zIndex: 10,
   },
   progressTitle: { fontSize: font.size.lg, fontWeight: '700', color: colors.textPrimary, textAlign: 'center' },
   progressSub: { fontSize: font.size.sm, color: colors.textSecondary, textAlign: 'center', lineHeight: 20 },
@@ -460,10 +471,5 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   closeBtnText: { fontSize: font.size.sm, color: colors.textSecondary },
-  hiddenWebView: {
-    position: 'absolute',
-    width: 1,
-    height: 1,
-    opacity: 0,
-  },
+  hiddenWebView: { flex: 1 },
 })
