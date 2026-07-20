@@ -43,7 +43,6 @@ export default function Profile() {
   const [showWebView, setShowWebView] = useState(false)
   const [webViewReady, setWebViewReady] = useState(false)
   const [capturingSession, setCapturingSession] = useState(false)
-  const [githubToken, setGithubToken] = useState('')
   const webViewRef = useRef<WebViewType>(null)
   const capturedRef = useRef(false)
 
@@ -69,7 +68,6 @@ export default function Profile() {
       setAllergies(data.allergies ?? [])
       setBrands(data.brands ?? [])
       setInstacartConnected(!!data.instacart_session)
-      setGithubToken(data.github_token ?? '')
     }
   }
 
@@ -104,7 +102,6 @@ export default function Profile() {
       dietary,
       allergies,
       brands,
-      github_token: githubToken.trim(),
     }
 
     if (profileId) {
@@ -319,26 +316,6 @@ export default function Profile() {
             </TouchableOpacity>
           )}
           <Text style={styles.secureNote}>Your session is encrypted and only used by the shopping agent</Text>
-        </View>
-
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Shop Now Access</Text>
-          <Text style={styles.cardSubtitle}>
-            Paste a GitHub Personal Access Token (workflow scope) to enable the Shop Now button
-          </Text>
-          <TextInput
-            style={styles.inlineInput}
-            value={githubToken}
-            onChangeText={setGithubToken}
-            placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
-            placeholderTextColor={colors.textMuted}
-            secureTextEntry
-            autoCapitalize="none"
-            autoCorrect={false}
-          />
-          <Text style={styles.secureNote}>
-            Create one at github.com → Settings → Developer settings → Personal access tokens → Fine-grained → workflow scope
-          </Text>
         </View>
 
         <TouchableOpacity

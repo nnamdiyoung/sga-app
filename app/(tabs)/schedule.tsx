@@ -14,9 +14,6 @@ const REMINDER_OPTIONS = [
   { label: '1 day before', value: 24 },
 ]
 
-const GITHUB_REPO = 'nnamdiyoung/sga-app'
-const WORKFLOW_FILE = 'shopping-agent.yml'
-
 export default function Schedule() {
   const [selectedDays, setSelectedDays] = useState<number[]>([0])
   const [hour, setHour] = useState(9)
@@ -26,7 +23,6 @@ export default function Schedule() {
   const [saving, setSaving] = useState(false)
   const [scheduleId, setScheduleId] = useState<string | null>(null)
   const [shopping, setShopping] = useState(false)
-  const [githubToken, setGithubToken] = useState('')
 
   useEffect(() => {
     loadSchedule()
@@ -35,53 +31,25 @@ export default function Schedule() {
   async function loadSchedule() {
     const { data: { user } } = await supabase.auth.getUser()
     if (!user) return
-    const [schedRes, profileRes] = await Promise.all([
-      supabase.from('schedules').select('*').eq('user_id', user.id).single(),
-      supabase.from('profiles').select('github_token').eq('user_id', user.id).single(),
-    ])
-    if (schedRes.data) {
-      setScheduleId(schedRes.data.id)
-      setSelectedDays(schedRes.data.days ?? [0])
-      setHour(parseInt(schedRes.data.time?.split(':')[0] ?? '9'))
-      setReminderEnabled(schedRes.data.reminder_enabled ?? true)
-      setReminderHours(schedRes.data.reminder_hours_before ?? 1)
-      setActive(schedRes.data.active ?? true)
-    }
-    if (profileRes.data?.github_token) {
-      setGithubToken(profileRes.data.github_token)
+    const { data } = await supabase.from('schedules').select('*').eq('user_id', user.id).single()
+    if (data) {
+      setScheduleId(data.id)
+      setSelectedDays(data.days ?? [0])
+      setHour(parseInt(data.time?.split(':')[0] ?? '9'))
+      setReminderEnabled(data.reminder_enabled ?? true)
+      setReminderHours(data.reminder_hours_before ?? 1)
+      setActive(data.active ?? true)
     }
   }
 
   async function shopNow() {
-    if (!githubToken) {
-      Alert.alert(
-        'Setup required',
-        'Go to Profile → Shop Now Access and paste your GitHub token first.'
-      )
-      return
-    }
     setShopping(true)
     try {
-      const res = await fetch(
-        `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${WORKFLOW_FILE}/dispatches`,
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `token ${githubToken}`,
-            Accept: 'application/vnd.github.v3+json',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ ref: 'main', inputs: { force_run: 'true' } }),
-        }
-      )
-      if (res.status === 204) {
-        Alert.alert('Shopping started!', 'Your cart will be ready in about 2 minutes. Check the Cart tab.')
-      } else {
-        const text = await res.text()
-        Alert.alert('Error', `GitHub returned ${res.status}. Check your token has "workflow" scope.\n\n${text.substring(0, 120)}`)
-      }
+      const { error } = await supabase.functions.invoke('trigger-shopping-agent')
+      if (error) throw error
+      Alert.alert('Shopping started!', 'Your cart will be ready in about 2 minutes. Check the Cart tab.')
     } catch {
-      Alert.alert('Error', 'Could not reach GitHub. Check your internet connection.')
+      Alert.alert('Error', 'Could not start shopping. Please try again.')
     }
     setShopping(false)
   }
