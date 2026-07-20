@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, TouchableOpacity, FlatList,
-  StyleSheet, SafeAreaView, Image, Alert, Modal, ActivityIndicator
+  StyleSheet, SafeAreaView, Image, Alert, Modal, ActivityIndicator, Linking
 } from 'react-native'
 import { WebView } from 'react-native-webview'
 import type { WebView as WebViewType } from 'react-native-webview'
@@ -9,34 +9,49 @@ import { supabase } from '../../lib/supabase'
 import { colors, spacing, radius, font } from '../../lib/theme'
 import type { Cart, CartItem } from '../../lib/types'
 
-const ADD_TO_CART_JS = `
-  (function() {
-    var selectors = [
-      '[data-testid="add-item-to-cart-button"]',
-      '[data-testid*="add-to-cart"]',
-      'button[aria-label*="Add to cart" i]',
-      'button[aria-label*="Add" i]',
-      'button'
-    ];
-    var clicked = false;
-    for (var s of selectors) {
-      var els = document.querySelectorAll(s);
-      for (var el of Array.from(els)) {
-        var text = el.textContent ? el.textContent.trim() : '';
-        var label = el.getAttribute('aria-label') || '';
-        if ((text === 'Add' || text === 'Add to cart' || label.toLowerCase().includes('add to cart')) && !label.toLowerCase().includes('address')) {
-          el.click();
-          clicked = true;
-          break;
-        }
+// Injected after page settles — grabs OG image and clicks the Add button
+const INJECT_JS = `
+(function() {
+  // Grab the OG image for display in the app
+  var ogImg = '';
+  var metaOg = document.querySelector('meta[property="og:image"]');
+  if (metaOg) ogImg = metaOg.getAttribute('content') || '';
+
+  // Try every reasonable selector for the Add to cart button
+  var clicked = false;
+  var candidates = [
+    '[data-testid="add-item-to-cart-button"]',
+    '[data-testid*="add_to_cart"]',
+    '[data-testid*="add-to-cart"]',
+  ];
+  for (var c of candidates) {
+    var el = document.querySelector(c);
+    if (el) { el.click(); clicked = true; break; }
+  }
+
+  if (!clicked) {
+    // aria-label approach
+    var allBtns = Array.from(document.querySelectorAll('button, [role="button"]'));
+    for (var btn of allBtns) {
+      var lbl = (btn.getAttribute('aria-label') || '').toLowerCase();
+      var txt = (btn.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      if (
+        lbl.includes('add to cart') ||
+        lbl.includes('add item') ||
+        txt === 'add to cart' ||
+        txt === 'add item' ||
+        txt === 'add'
+      ) {
+        btn.click();
+        clicked = true;
+        break;
       }
-      if (clicked) break;
     }
-    setTimeout(function() {
-      window.ReactNativeWebView.postMessage(JSON.stringify({ clicked: clicked, url: window.location.href }));
-    }, 1500);
-  })();
-  true;
+  }
+
+  window.ReactNativeWebView.postMessage(JSON.stringify({ clicked: clicked, image: ogImg }));
+})();
+true;
 `
 
 export default function CartScreen() {
@@ -49,6 +64,8 @@ export default function CartScreen() {
   const [addedCount, setAddedCount] = useState(0)
   const webViewRef = useRef<WebViewType>(null)
   const addedRef = useRef(0)
+  const indexRef = useRef(0)
+  const queueRef = useRef<CartItem[]>([])
 
   useEffect(() => {
     fetchLatestCart()
@@ -65,7 +82,6 @@ export default function CartScreen() {
       .order('created_at', { ascending: false })
       .limit(1)
       .single()
-
     setCart(cartData ?? null)
     setLoading(false)
   }
@@ -75,7 +91,7 @@ export default function CartScreen() {
     setCart(prev => prev ? {
       ...prev,
       items: prev.items.filter(i => i.id !== itemId),
-      total: prev.items.filter(i => i.id !== itemId).reduce((sum, i) => sum + i.price, 0),
+      total: prev.items.filter(i => i.id !== itemId).reduce((s, i) => s + i.price, 0),
     } : null)
   }
 
@@ -87,15 +103,16 @@ export default function CartScreen() {
 
   function startAddToInstacart() {
     if (!cart || cart.items.length === 0) return
-    // Only queue items that have a real Instacart product URL
     const instacartItems = cart.items.filter(
       i => i.product_url && i.product_url.startsWith('https://www.instacart.ca/products/')
     )
     if (instacartItems.length === 0) {
-      Alert.alert('No product links', 'The agent did not capture direct product links for these items.')
+      Alert.alert('No product links', 'Run the agent again to get direct Instacart product links.')
       return
     }
     addedRef.current = 0
+    indexRef.current = 0
+    queueRef.current = instacartItems
     setAddedCount(0)
     setAddQueue(instacartItems)
     setAddIndex(0)
@@ -104,49 +121,75 @@ export default function CartScreen() {
   }
 
   function handleWebViewLoad() {
-    // Page loaded — inject the add-to-cart script
+    // Give the React SPA time to hydrate and render the Add button
     setTimeout(() => {
-      webViewRef.current?.injectJavaScript(ADD_TO_CART_JS)
-    }, 2500)
+      webViewRef.current?.injectJavaScript(INJECT_JS)
+    }, 4000)
   }
 
-  function handleWebViewMessage(event: { nativeEvent: { data: string } }) {
+  async function handleWebViewMessage(event: { nativeEvent: { data: string } }) {
     try {
       const data = JSON.parse(event.nativeEvent.data)
+
+      // Save the OG image back to Supabase for this cart item
+      const currentItem = queueRef.current[indexRef.current]
+      if (data.image && currentItem) {
+        supabase.from('cart_items')
+          .update({ image_url: data.image })
+          .eq('id', currentItem.id)
+          .then(() => {
+            setCart(prev => {
+              if (!prev) return prev
+              return {
+                ...prev,
+                items: prev.items.map(i =>
+                  i.id === currentItem.id ? { ...i, image_url: data.image } : i
+                )
+              }
+            })
+          })
+      }
+
       if (data.clicked) {
         addedRef.current += 1
         setAddedCount(addedRef.current)
       }
-      // Move to next item
-      const nextIndex = addIndex + 1
-      if (nextIndex < addQueue.length) {
+
+      const nextIndex = indexRef.current + 1
+      indexRef.current = nextIndex
+
+      if (nextIndex < queueRef.current.length) {
         setAddIndex(nextIndex)
       } else {
         setAddStatus('done')
       }
-    } catch { /* ignore parse errors */ }
+    } catch { /* ignore */ }
   }
 
-  function handleAddFlowClose() {
+  function handleDone() {
     setShowAddFlow(false)
     setAddStatus('idle')
     setAddIndex(0)
     setAddQueue([])
+    indexRef.current = 0
+    queueRef.current = []
+  }
+
+  function openInstacart() {
+    Linking.openURL('https://www.instacart.ca')
+    markCheckedOut()
+    handleDone()
   }
 
   if (loading) return (
     <SafeAreaView style={styles.container}>
-      <View style={styles.center}>
-        <Text style={styles.loadingText}>Loading cart...</Text>
-      </View>
+      <View style={styles.center}><Text style={styles.loadingText}>Loading cart...</Text></View>
     </SafeAreaView>
   )
 
   if (!cart || cart.items.length === 0) return (
     <SafeAreaView style={styles.container}>
-      <View style={styles.header}>
-        <Text style={styles.title}>Cart</Text>
-      </View>
+      <View style={styles.header}><Text style={styles.title}>Cart</Text></View>
       <View style={styles.center}>
         <Text style={styles.emptyIcon}>🛒</Text>
         <Text style={styles.emptyTitle}>No cart ready yet</Text>
@@ -165,7 +208,9 @@ export default function CartScreen() {
       <View style={styles.header}>
         <View>
           <Text style={styles.title}>Your Cart</Text>
-          <Text style={styles.subtitle}>{cart.items.length} items · AI picked on {new Date(cart.created_at).toLocaleDateString('en-CA', { month: 'short', day: 'numeric' })}</Text>
+          <Text style={styles.subtitle}>
+            {cart.items.length} items · AI picked on {new Date(cart.created_at).toLocaleDateString('en-CA', { month: 'short', day: 'numeric' })}
+          </Text>
         </View>
       </View>
 
@@ -176,10 +221,16 @@ export default function CartScreen() {
         renderItem={({ item }) => (
           <View style={styles.cartItem}>
             {item.image_url ? (
-              <Image source={{ uri: item.image_url }} style={styles.productImage} />
+              <Image
+                source={{ uri: item.image_url }}
+                style={styles.productImage}
+                resizeMode="contain"
+              />
             ) : (
-              <View style={[styles.productImage, styles.productImagePlaceholder]}>
-                <Text style={{ fontSize: 28 }}>🛍️</Text>
+              <View style={[styles.productImage, styles.imagePlaceholder]}>
+                <Text style={styles.imagePlaceholderText}>
+                  {item.product_name?.charAt(0)?.toUpperCase() ?? '?'}
+                </Text>
               </View>
             )}
             <View style={styles.productInfo}>
@@ -189,10 +240,7 @@ export default function CartScreen() {
             </View>
             <View style={styles.productRight}>
               <Text style={styles.productPrice}>${item.price.toFixed(2)}</Text>
-              <TouchableOpacity
-                onPress={() => removeCartItem(item.id)}
-                style={styles.removeBtn}
-              >
+              <TouchableOpacity onPress={() => removeCartItem(item.id)} style={styles.removeBtn}>
                 <Text style={styles.removeBtnText}>Remove</Text>
               </TouchableOpacity>
             </View>
@@ -215,48 +263,50 @@ export default function CartScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* In-app WebView add-to-cart flow */}
       <Modal visible={showAddFlow} animationType="slide" presentationStyle="fullScreen">
         <SafeAreaView style={styles.modalContainer}>
           <View style={styles.modalHeader}>
             <Text style={styles.modalTitle}>Adding to Instacart</Text>
-            {addStatus !== 'done' && (
+            {addStatus === 'adding' && (
               <Text style={styles.modalSubtitle}>
                 {addIndex + 1} of {addQueue.length} — {currentItem?.grocery_item_name}
               </Text>
             )}
           </View>
 
-          {/* Progress overlay */}
-          <View style={styles.progressOverlay}>
-            {addStatus === 'adding' ? (
-              <>
-                <ActivityIndicator size="large" color={colors.primary} />
-                <Text style={styles.progressTitle}>
-                  Adding {currentItem?.grocery_item_name}...
-                </Text>
-                <Text style={styles.progressSub}>
-                  {addIndex + 1} of {addQueue.length} items
-                </Text>
-                <View style={styles.progressBar}>
-                  <View style={[styles.progressFill, { width: `${((addIndex) / addQueue.length) * 100}%` }]} />
-                </View>
-              </>
-            ) : (
-              <>
-                <Text style={styles.doneIcon}>✅</Text>
-                <Text style={styles.progressTitle}>
-                  {addedCount} of {addQueue.length} items added to Instacart
-                </Text>
-                <Text style={styles.progressSub}>
-                  Open Instacart and go to your cart to checkout
-                </Text>
-                <TouchableOpacity style={styles.doneBtn} onPress={handleAddFlowClose}>
-                  <Text style={styles.doneBtnText}>Done</Text>
-                </TouchableOpacity>
-              </>
-            )}
-          </View>
+          {addStatus === 'adding' ? (
+            <View style={styles.progressOverlay}>
+              <ActivityIndicator size="large" color={colors.primary} />
+              <Text style={styles.progressTitle}>
+                Adding {currentItem?.grocery_item_name}...
+              </Text>
+              <Text style={styles.progressSub}>{currentItem?.product_name}</Text>
+              <View style={styles.progressBar}>
+                <View style={[styles.progressFill, { width: `${(addIndex / addQueue.length) * 100}%` }]} />
+              </View>
+              <Text style={styles.progressCount}>{addIndex + 1} of {addQueue.length}</Text>
+            </View>
+          ) : (
+            <View style={styles.progressOverlay}>
+              <Text style={styles.doneIcon}>
+                {addedCount === addQueue.length ? '✅' : '⚠️'}
+              </Text>
+              <Text style={styles.progressTitle}>
+                {addedCount} of {addQueue.length} items added to Instacart
+              </Text>
+              <Text style={styles.progressSub}>
+                {addedCount > 0
+                  ? 'Open Instacart to review your cart and checkout'
+                  : 'Could not add items automatically — open Instacart to add manually'}
+              </Text>
+              <TouchableOpacity style={styles.openInstacartBtn} onPress={openInstacart}>
+                <Text style={styles.openInstacartBtnText}>Open Instacart →</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.closeBtn} onPress={handleDone}>
+                <Text style={styles.closeBtnText}>Close</Text>
+              </TouchableOpacity>
+            </View>
+          )}
 
           {/* Hidden WebView doing the work */}
           {addStatus === 'adding' && currentItem?.product_url && (
@@ -270,7 +320,7 @@ export default function CartScreen() {
               domStorageEnabled
               sharedCookiesEnabled
               thirdPartyCookiesEnabled
-              userAgent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+              userAgent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             />
           )}
         </SafeAreaView>
@@ -284,9 +334,6 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: spacing.xl },
   loadingText: { color: colors.textSecondary },
   header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
     paddingHorizontal: spacing.lg,
     paddingTop: spacing.lg,
     paddingBottom: spacing.md,
@@ -314,9 +361,15 @@ const styles = StyleSheet.create({
     borderRadius: radius.sm,
     backgroundColor: colors.background,
   },
-  productImagePlaceholder: {
+  imagePlaceholder: {
     alignItems: 'center',
     justifyContent: 'center',
+    backgroundColor: colors.primaryLight,
+  },
+  imagePlaceholderText: {
+    fontSize: 24,
+    fontWeight: '800',
+    color: colors.primary,
   },
   productInfo: { flex: 1, gap: 2 },
   productName: { fontSize: font.size.sm, fontWeight: '600', color: colors.textPrimary, lineHeight: 18 },
@@ -379,29 +432,34 @@ const styles = StyleSheet.create({
     gap: spacing.md,
   },
   progressTitle: { fontSize: font.size.lg, fontWeight: '700', color: colors.textPrimary, textAlign: 'center' },
-  progressSub: { fontSize: font.size.sm, color: colors.textSecondary, textAlign: 'center' },
+  progressSub: { fontSize: font.size.sm, color: colors.textSecondary, textAlign: 'center', lineHeight: 20 },
   progressBar: {
     width: '100%',
     height: 6,
     backgroundColor: colors.border,
     borderRadius: 3,
-    marginTop: spacing.md,
+    marginTop: spacing.sm,
     overflow: 'hidden',
   },
-  progressFill: {
-    height: '100%',
-    backgroundColor: colors.primary,
-    borderRadius: 3,
-  },
+  progressFill: { height: '100%', backgroundColor: colors.primary, borderRadius: 3 },
+  progressCount: { fontSize: font.size.xs, color: colors.textMuted },
   doneIcon: { fontSize: 52, marginBottom: spacing.sm },
-  doneBtn: {
+  openInstacartBtn: {
     marginTop: spacing.md,
     backgroundColor: colors.primary,
     borderRadius: radius.md,
     paddingVertical: 14,
     paddingHorizontal: spacing.xl,
+    width: '100%',
+    alignItems: 'center',
   },
-  doneBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
+  openInstacartBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
+  closeBtn: {
+    paddingVertical: 12,
+    alignItems: 'center',
+    width: '100%',
+  },
+  closeBtnText: { fontSize: font.size.sm, color: colors.textSecondary },
   hiddenWebView: {
     position: 'absolute',
     width: 1,
