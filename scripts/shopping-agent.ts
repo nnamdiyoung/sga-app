@@ -1,15 +1,18 @@
 import { createClient } from "@supabase/supabase-js";
 import Anthropic from "@anthropic-ai/sdk";
-import { chromium } from "playwright";
+import { chromium, Browser, Page } from "playwright";
 import { Resend } from "resend";
+import * as fs from "fs";
+import * as path from "path";
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
-
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
 const resend = new Resend(process.env.RESEND_API_KEY!);
+
+const SCREENSHOT_DIR = "/tmp/sga-screenshots";
 
 interface Profile {
   user_id: string;
@@ -46,138 +49,262 @@ interface SelectedProduct {
 
 function isEasternDST(date: Date): boolean {
   const year = date.getUTCFullYear();
-  // DST starts second Sunday of March, ends first Sunday of November
   const marchStart = new Date(Date.UTC(year, 2, 1));
-  const marchDay = marchStart.getUTCDay();
-  const dstStart = new Date(Date.UTC(year, 2, 8 + (7 - marchDay) % 7, 7));
+  const dstStart = new Date(Date.UTC(year, 2, 8 + (7 - marchStart.getUTCDay()) % 7, 7));
   const novStart = new Date(Date.UTC(year, 10, 1));
-  const novDay = novStart.getUTCDay();
-  const dstEnd = new Date(Date.UTC(year, 10, 1 + (7 - novDay) % 7, 6));
+  const dstEnd = new Date(Date.UTC(year, 10, 1 + (7 - novStart.getUTCDay()) % 7, 6));
   return date >= dstStart && date < dstEnd;
 }
 
-function getEasternHour(date: Date): number {
-  const offsetHours = isEasternDST(date) ? -4 : -5;
-  const utcHours = date.getUTCHours();
-  return ((utcHours + offsetHours) + 24) % 24;
+function getEasternTime(date: Date): { hour: number; day: number } {
+  const offset = isEasternDST(date) ? -4 : -5;
+  const et = new Date(date.getTime() + offset * 3600000);
+  return { hour: et.getUTCHours(), day: et.getUTCDay() };
 }
 
-function getEasternDay(date: Date): number {
-  const offsetHours = isEasternDST(date) ? -4 : -5;
-  const utcMs = date.getTime();
-  const etMs = utcMs + offsetHours * 60 * 60 * 1000;
-  return new Date(etMs).getUTCDay();
+async function saveScreenshot(page: Page, label: string): Promise<void> {
+  try {
+    if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+    const file = path.join(SCREENSHOT_DIR, `${label}-${Date.now()}.png`);
+    await page.screenshot({ path: file, fullPage: false });
+    console.log(`Screenshot saved: ${file}`);
+  } catch { /* non-fatal */ }
 }
 
 async function getUsersToShopFor(): Promise<string[]> {
-  const now = new Date();
-  const etHour = getEasternHour(now);
-  const etDay = getEasternDay(now);
+  const { hour, day } = getEasternTime(new Date());
+  console.log(`Current ET time: day=${day}, hour=${hour}`);
 
-  const { data: schedules, error } = await supabase
+  const { data, error } = await supabase
     .from("schedules")
     .select("user_id, days, time")
     .eq("active", true);
 
-  if (error || !schedules) return [];
+  if (error || !data) return [];
 
-  return schedules
+  return data
     .filter((s) => {
-      if (!s.days.includes(etDay)) return false;
-      const [schedHour] = s.time.split(":").map(Number);
-      return schedHour === etHour;
+      const schedHour = parseInt(s.time.split(":")[0]);
+      const match = s.days.includes(day) && schedHour === hour;
+      console.log(`Schedule check user ${s.user_id}: days=${JSON.stringify(s.days)} time=${s.time} → ${match ? "MATCH" : "skip"}`);
+      return match;
     })
     .map((s) => s.user_id);
 }
 
-async function scrapeWalmart(item: string): Promise<ProductResult[]> {
-  const browser = await chromium.launch({ headless: true });
+async function loginInstacart(page: Page, email: string, password: string): Promise<boolean> {
+  if (!email || !password) {
+    console.log("No Instacart credentials provided, skipping login.");
+    return false;
+  }
+
   try {
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      viewport: { width: 1280, height: 800 },
-    });
-    const page = await context.newPage();
-    await page.goto(
-      `https://www.walmart.ca/search?q=${encodeURIComponent(item)}`,
-      { waitUntil: "domcontentloaded" }
-    );
+    console.log("Navigating to Instacart login...");
+    await page.goto("https://www.instacart.ca/login", { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForTimeout(2000);
+    await saveScreenshot(page, "instacart-login-page");
+
+    console.log(`Login page URL: ${page.url()}, title: ${await page.title()}`);
+
+    // Fill email
+    const emailField = page.locator('input[type="email"], input[name="email"], input[id*="email"]').first();
+    await emailField.waitFor({ timeout: 10000 });
+    await emailField.fill(email);
+    console.log("Filled email.");
+
+    // Fill password
+    const passwordField = page.locator('input[type="password"], input[name="password"]').first();
+    await passwordField.fill(password);
+    console.log("Filled password.");
+
+    await saveScreenshot(page, "instacart-before-submit");
+
+    // Submit
+    const submitBtn = page.locator('button[type="submit"], button:has-text("Log in"), button:has-text("Sign in")').first();
+    await submitBtn.click();
+    await page.waitForTimeout(4000);
+    await saveScreenshot(page, "instacart-after-submit");
+
+    const currentUrl = page.url();
+    console.log(`After login URL: ${currentUrl}`);
+
+    const loggedIn = !currentUrl.includes("/login");
+    console.log(loggedIn ? "Instacart login successful." : "Instacart login may have failed.");
+    return loggedIn;
+  } catch (err) {
+    console.log(`Instacart login error: ${err}`);
+    await saveScreenshot(page, "instacart-login-error");
+    return false;
+  }
+}
+
+async function searchInstacart(page: Page, item: string): Promise<ProductResult[]> {
+  try {
+    const url = `https://www.instacart.ca/store/s?k=${encodeURIComponent(item)}`;
+    console.log(`Searching Instacart for "${item}": ${url}`);
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForTimeout(3000);
+    await saveScreenshot(page, `instacart-search-${item.replace(/\s/g, "_")}`);
+
+    console.log(`Search page URL: ${page.url()}, title: ${await page.title()}`);
 
     const results = await page.evaluate(() => {
-      const items = document.querySelectorAll(
-        '[data-automation="search-result-listitem"]'
-      );
       const found: { name: string; price: number; image: string; url: string }[] = [];
-      items.forEach((el) => {
-        const nameEl = el.querySelector('[data-automation="product-title"]');
-        const priceEl = el.querySelector('[data-automation="product-price"]');
-        const imgEl = el.querySelector("img");
-        const linkEl = el.querySelector("a");
-        if (!nameEl || !priceEl) return;
-        const priceText = priceEl.textContent ?? "";
-        const priceMatch = priceText.match(/[\d.]+/);
-        if (!priceMatch) return;
-        found.push({
-          name: nameEl.textContent?.trim() ?? "",
-          price: parseFloat(priceMatch[0]),
-          image: imgEl?.src ?? "",
-          url: linkEl?.href ?? "",
-        });
+
+      // Try multiple selector strategies
+      const selectors = [
+        '[data-testid="item-card"]',
+        '[data-testid="product-card"]',
+        '[class*="ItemCard"]',
+        '[class*="ProductCard"]',
+        'li[class*="item"]',
+        'article',
+      ];
+
+      let cards: NodeListOf<Element> | null = null;
+      for (const sel of selectors) {
+        const els = document.querySelectorAll(sel);
+        if (els.length > 0) {
+          cards = els;
+          console.log(`Found ${els.length} cards with selector: ${sel}`);
+          break;
+        }
+      }
+
+      if (!cards || cards.length === 0) return found;
+
+      cards.forEach((card) => {
+        // Try to extract name
+        const nameEl =
+          card.querySelector('[data-testid="item-name"]') ??
+          card.querySelector('[class*="name"]') ??
+          card.querySelector('span[aria-label]') ??
+          card.querySelector('p') ??
+          card.querySelector('span');
+
+        // Try to extract price
+        const priceEl =
+          card.querySelector('[data-testid="item-price"]') ??
+          card.querySelector('[class*="price"]') ??
+          card.querySelector('[aria-label*="$"]');
+
+        const imgEl = card.querySelector("img");
+        const linkEl = card.querySelector("a");
+
+        const name = nameEl?.textContent?.trim();
+        const priceText = priceEl?.textContent ?? card.textContent ?? "";
+        const priceMatch = priceText.match(/\$?([\d]+\.[\d]{2})/);
+
+        if (name && priceMatch) {
+          found.push({
+            name,
+            price: parseFloat(priceMatch[1]),
+            image: imgEl?.src ?? "",
+            url: linkEl?.href ?? "",
+          });
+        }
       });
+
       return found.slice(0, 5);
     });
 
-    await browser.close();
-    return results.map((r) => ({ ...r, store: "Walmart" }));
-  } catch {
-    await browser.close().catch(() => {});
+    console.log(`Instacart found ${results.length} results for "${item}"`);
+
+    if (results.length === 0) {
+      // Log a snippet of the HTML to help debug selectors
+      const htmlSnippet = await page.evaluate(() => document.body.innerHTML.substring(0, 1000));
+      console.log(`HTML snippet (first 1000 chars): ${htmlSnippet}`);
+    }
+
+    return results.map((r) => ({ ...r, store: "Instacart" }));
+  } catch (err) {
+    console.log(`Instacart search error for "${item}": ${err}`);
+    await saveScreenshot(page, `instacart-error-${item.replace(/\s/g, "_")}`);
     return [];
   }
 }
 
-async function scrapeInstacart(item: string): Promise<ProductResult[]> {
-  const browser = await chromium.launch({ headless: true });
+async function searchWalmart(page: Page, item: string): Promise<ProductResult[]> {
   try {
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      viewport: { width: 1280, height: 800 },
-    });
-    const page = await context.newPage();
-    await page.goto(
-      `https://www.instacart.ca/store/s?k=${encodeURIComponent(item)}`,
-      { waitUntil: "domcontentloaded" }
-    );
-    await page.waitForTimeout(2000);
+    const url = `https://www.walmart.ca/search?q=${encodeURIComponent(item)}`;
+    console.log(`Searching Walmart for "${item}": ${url}`);
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForTimeout(3000);
+    await saveScreenshot(page, `walmart-search-${item.replace(/\s/g, "_")}`);
+
+    console.log(`Walmart page URL: ${page.url()}, title: ${await page.title()}`);
 
     const results = await page.evaluate(() => {
-      const items = document.querySelectorAll('[data-testid="item-card"]');
       const found: { name: string; price: number; image: string; url: string }[] = [];
-      items.forEach((el) => {
-        const nameEl = el.querySelector('[data-testid="item-name"]');
-        const priceEl = el.querySelector('[data-testid="item-price"]');
-        const imgEl = el.querySelector("img");
-        const linkEl = el.querySelector("a");
-        if (!nameEl || !priceEl) return;
-        const priceText = priceEl.textContent ?? "";
-        const priceMatch = priceText.match(/[\d.]+/);
-        if (!priceMatch) return;
-        found.push({
-          name: nameEl.textContent?.trim() ?? "",
-          price: parseFloat(priceMatch[0]),
-          image: imgEl?.src ?? "",
-          url: linkEl?.href ?? "",
-        });
+
+      const selectors = [
+        '[data-automation="search-result-listitem"]',
+        '[data-item-id]',
+        '[class*="ProductTile"]',
+        '[class*="product-tile"]',
+        'li[class*="search"]',
+        'article',
+      ];
+
+      let cards: NodeListOf<Element> | null = null;
+      for (const sel of selectors) {
+        const els = document.querySelectorAll(sel);
+        if (els.length > 0) {
+          cards = els;
+          break;
+        }
+      }
+
+      if (!cards || cards.length === 0) return found;
+
+      cards.forEach((card) => {
+        const nameEl =
+          card.querySelector('[data-automation="product-title"]') ??
+          card.querySelector('[class*="product-title"]') ??
+          card.querySelector('[class*="ProductTitle"]') ??
+          card.querySelector('a[aria-label]') ??
+          card.querySelector('span[aria-label]');
+
+        const priceEl =
+          card.querySelector('[data-automation="buybox-price"]') ??
+          card.querySelector('[class*="price-characteristic"]') ??
+          card.querySelector('[class*="Price"]') ??
+          card.querySelector('[class*="price"]');
+
+        const imgEl = card.querySelector("img");
+        const linkEl = card.querySelector("a");
+
+        const name =
+          nameEl?.textContent?.trim() ??
+          nameEl?.getAttribute("aria-label") ??
+          linkEl?.getAttribute("aria-label");
+
+        const priceText = priceEl?.textContent ?? card.textContent ?? "";
+        const priceMatch = priceText.match(/\$?([\d]+\.[\d]{2})/);
+
+        if (name && priceMatch) {
+          found.push({
+            name,
+            price: parseFloat(priceMatch[1]),
+            image: imgEl?.src ?? "",
+            url: linkEl?.href ?? "",
+          });
+        }
       });
+
       return found.slice(0, 5);
     });
 
-    await browser.close();
-    return results.map((r) => ({ ...r, store: "Instacart" }));
-  } catch {
-    await browser.close().catch(() => {});
+    console.log(`Walmart found ${results.length} results for "${item}"`);
+
+    if (results.length === 0) {
+      const htmlSnippet = await page.evaluate(() => document.body.innerHTML.substring(0, 1000));
+      console.log(`Walmart HTML snippet: ${htmlSnippet}`);
+    }
+
+    return results.map((r) => ({ ...r, store: "Walmart" }));
+  } catch (err) {
+    console.log(`Walmart search error for "${item}": ${err}`);
     return [];
   }
 }
@@ -187,54 +314,44 @@ async function pickBestProduct(
   quantity: string,
   options: ProductResult[],
   profile: Profile
-): Promise<{ index: number; reason: string }> {
-  const dietary = profile.dietary?.join(", ") || "none";
-  const allergies = profile.allergies?.join(", ") || "none";
+): Promise<number> {
+  if (options.length === 1) return 0;
 
-  const optionsList = options
-    .map((o, i) => `${i}. ${o.name} — $${o.price} CAD (${o.store})`)
-    .join("\n");
+  const optionsList = options.map((o, i) => `${i}. ${o.name} — $${o.price} CAD (${o.store})`).join("\n");
 
   try {
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 256,
-      system: `You are a grocery shopping assistant. The user has the following preferences:
+      system: `You are a grocery shopping assistant. User preferences:
 - Budget: $${profile.budget} CAD per shop
-- Dietary restrictions: ${dietary}
-- Allergies: ${allergies}
+- Dietary: ${profile.dietary?.join(", ") || "none"}
+- Allergies: ${profile.allergies?.join(", ") || "none"}
 - Preferred brands: ${profile.brands || "none"}
-
-Pick the best matching product for the user. Avoid anything that conflicts with their dietary restrictions or allergies. Prefer their preferred brands when available. Respond ONLY with JSON in this exact format: { "index": N, "reason": "one line" }`,
-      messages: [
-        {
-          role: "user",
-          content: `I need to buy: ${itemName} (quantity: ${quantity})\n\nOptions:\n${optionsList}\n\nWhich option is best?`,
-        },
-      ],
+Respond ONLY with JSON: { "index": N, "reason": "one line" }`,
+      messages: [{
+        role: "user",
+        content: `I need: ${itemName} (qty: ${quantity})\n\nOptions:\n${optionsList}\n\nBest pick?`,
+      }],
     });
 
-    const text =
-      response.content[0].type === "text" ? response.content[0].text : "";
-    const match = text.match(/\{.*\}/s);
+    const text = response.content[0].type === "text" ? response.content[0].text : "";
+    const match = text.match(/\{.*?\}/s);
     if (match) {
       const parsed = JSON.parse(match[0]);
-      return { index: parsed.index ?? 0, reason: parsed.reason ?? "" };
+      console.log(`Claude picked index ${parsed.index} for "${itemName}": ${parsed.reason}`);
+      return Math.min(parsed.index ?? 0, options.length - 1);
     }
-  } catch {
-    // fall through to default
+  } catch (err) {
+    console.log(`Claude pick error: ${err}`);
   }
 
-  return { index: 0, reason: "defaulted to first result" };
+  return 0;
 }
 
-async function processUser(userId: string): Promise<void> {
+async function processUser(userId: string, browser: Browser): Promise<void> {
   const [itemsRes, profileRes] = await Promise.all([
-    supabase
-      .from("grocery_items")
-      .select("name, quantity")
-      .eq("user_id", userId)
-      .eq("cleared", false),
+    supabase.from("grocery_items").select("name, quantity").eq("user_id", userId).eq("cleared", false),
     supabase.from("profiles").select("*").eq("user_id", userId).single(),
   ]);
 
@@ -246,23 +363,41 @@ async function processUser(userId: string): Promise<void> {
     return;
   }
 
+  console.log(`Processing ${items.length} items for user ${userId}`);
+
   const authRes = await supabase.auth.admin.getUserById(userId);
   const userEmail = authRes.data?.user?.email;
-  if (!userEmail) {
-    console.log(`No email for user ${userId}, skipping.`);
-    return;
-  }
+  if (!userEmail) return;
+
+  // Create a single browser context and page for this user
+  const context = await browser.newContext({
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    viewport: { width: 1280, height: 800 },
+    locale: "en-CA",
+  });
+  const page = await context.newPage();
+
+  // Log in to Instacart first
+  const instacartLoggedIn = await loginInstacart(page, profile?.instacart_email, profile?.instacart_password);
 
   const selectedProducts: SelectedProduct[] = [];
 
   for (const item of items) {
-    let results = await scrapeWalmart(item.name);
+    console.log(`\n--- Shopping for: ${item.name} ---`);
 
+    let results: ProductResult[] = [];
+
+    // Try Instacart first (preferably logged in)
+    results = await searchInstacart(page, item.name);
+
+    // Fall back to Walmart if Instacart yields nothing
     if (results.length === 0) {
-      results = await scrapeInstacart(item.name);
+      console.log(`No Instacart results, trying Walmart...`);
+      results = await searchWalmart(page, item.name);
     }
 
     if (results.length === 0) {
+      console.log(`No results found for "${item.name}", adding placeholder.`);
       selectedProducts.push({
         grocery_item_name: item.name,
         product_name: `Search for "${item.name}"`,
@@ -273,13 +408,9 @@ async function processUser(userId: string): Promise<void> {
         swapped: false,
       });
     } else {
-      const { index } = await pickBestProduct(
-        item.name,
-        item.quantity,
-        results,
-        profile
-      );
-      const chosen = results[Math.min(index, results.length - 1)];
+      const idx = await pickBestProduct(item.name, item.quantity, results, profile);
+      const chosen = results[idx];
+      console.log(`Picked: ${chosen.name} @ $${chosen.price} (${chosen.store})`);
       selectedProducts.push({
         grocery_item_name: item.name,
         product_name: chosen.name,
@@ -294,48 +425,26 @@ async function processUser(userId: string): Promise<void> {
     await new Promise((r) => setTimeout(r, 1500));
   }
 
+  await context.close();
+
   const total = selectedProducts.reduce((sum, p) => sum + (p.price ?? 0), 0);
 
   const { data: cart, error: cartError } = await supabase
     .from("carts")
-    .insert({
-      user_id: userId,
-      status: "pending",
-      total: parseFloat(total.toFixed(2)),
-      platform: "multi",
-    })
+    .insert({ user_id: userId, status: "pending", total: parseFloat(total.toFixed(2)), platform: "instacart" })
     .select("id")
     .single();
 
-  if (cartError || !cart) {
-    throw new Error(`Failed to create cart: ${cartError?.message}`);
-  }
+  if (cartError || !cart) throw new Error(`Failed to create cart: ${cartError?.message}`);
 
-  const cartItemRows = selectedProducts.map((p) => ({
-    cart_id: cart.id,
-    grocery_item_name: p.grocery_item_name,
-    product_name: p.product_name,
-    price: p.price,
-    image_url: p.image_url,
-    product_url: p.product_url,
-    store: p.store,
-    swapped: p.swapped,
-  }));
+  await supabase.from("cart_items").insert(
+    selectedProducts.map((p) => ({ cart_id: cart.id, ...p }))
+  );
 
-  await supabase.from("cart_items").insert(cartItemRows);
-
-  // Clear the grocery list now that it's been shopped
-  await supabase
-    .from("grocery_items")
-    .update({ cleared: true })
-    .eq("user_id", userId)
-    .eq("cleared", false);
+  await supabase.from("grocery_items").update({ cleared: true }).eq("user_id", userId).eq("cleared", false);
 
   const itemListHtml = selectedProducts
-    .map(
-      (p) =>
-        `<li><strong>${p.grocery_item_name}</strong> → ${p.product_name} ($${p.price.toFixed(2)} CAD)</li>`
-    )
+    .map((p) => `<li><strong>${p.grocery_item_name}</strong> → ${p.product_name} ($${p.price.toFixed(2)} CAD)</li>`)
     .join("\n");
 
   await resend.emails.send({
@@ -344,17 +453,13 @@ async function processUser(userId: string): Promise<void> {
     subject: `🛒 Your SGA cart is ready — ${selectedProducts.length} items, ~$${total.toFixed(2)} CAD`,
     html: `
       <h2>Your SGA cart is ready!</h2>
-      <p>We found <strong>${selectedProducts.length} items</strong> totalling approximately <strong>$${total.toFixed(2)} CAD</strong>.</p>
-      <ul>
-        ${itemListHtml}
-      </ul>
-      <p>Open the SGA app to review your cart and checkout.</p>
+      <p><strong>${selectedProducts.length} items</strong>, approximately <strong>$${total.toFixed(2)} CAD</strong>.</p>
+      <ul>${itemListHtml}</ul>
+      <p>Open the SGA app to review and checkout.</p>
     `,
   });
 
-  console.log(
-    `Done for user ${userId}: ${selectedProducts.length} items, $${total.toFixed(2)} CAD. Email sent to ${userEmail}.`
-  );
+  console.log(`\nDone for user ${userId}: ${selectedProducts.length} items, $${total.toFixed(2)} CAD.`);
 }
 
 async function main(): Promise<void> {
@@ -363,14 +468,19 @@ async function main(): Promise<void> {
   const userIds = await getUsersToShopFor();
   console.log(`Found ${userIds.length} user(s) to shop for.`);
 
+  if (userIds.length === 0) return;
+
+  const browser = await chromium.launch({ headless: true });
+
   for (const userId of userIds) {
     try {
-      await processUser(userId);
+      await processUser(userId, browser);
     } catch (err) {
-      console.error(`Error processing user ${userId}:`, err);
+      console.error(`Error for user ${userId}:`, err);
     }
   }
 
+  await browser.close();
   console.log("SGA Shopping Agent done.");
 }
 
