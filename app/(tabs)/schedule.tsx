@@ -41,6 +41,10 @@ export default function Schedule() {
   }, [])
 
   useFocusEffect(useCallback(() => {
+    // Re-check DB if spinner was stuck when user comes back to tab
+    if (agentRunningRef.current) {
+      startWatchingForCart()
+    }
     return () => {
       if (!agentRunningRef.current) {
         setCartReady(false)
@@ -99,9 +103,26 @@ export default function Schedule() {
     setShopping(false)
   }
 
-function startWatchingForCart() {
-    supabase.auth.getUser().then(({ data: { user } }) => {
+  function startWatchingForCart() {
+    supabase.auth.getUser().then(async ({ data: { user } }) => {
       if (!user) return
+
+      // Check if cart already exists (agent may have finished before subscription started)
+      const since = new Date(Date.now() - 30 * 60 * 1000).toISOString()
+      const { data: existing } = await supabase
+        .from('carts')
+        .select('id')
+        .eq('user_id', user.id)
+        .gte('created_at', since)
+        .limit(1)
+        .maybeSingle()
+
+      if (existing) {
+        setAgentRunning(false)
+        setCartReady(true)
+        return
+      }
+
       const channel = supabase
         .channel('schedule-cart-watch')
         .on('postgres_changes', {
