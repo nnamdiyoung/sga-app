@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, TextInput, TouchableOpacity, FlatList,
   StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform,
-  Alert, Animated
+  Alert, Animated, RefreshControl
 } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
 import { supabase } from '../../lib/supabase'
@@ -20,8 +20,31 @@ export default function GroceryList() {
   const inputRef = useRef<TextInput>(null)
 
   useEffect(() => {
-    fetchItems()
-    fetchNextShop()
+    let channel: ReturnType<typeof supabase.channel> | null = null
+
+    async function init() {
+      fetchNextShop()
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) return
+
+      await fetchItems()
+
+      // Auto-clear list when agent marks items as cleared
+      channel = supabase
+        .channel('grocery-items-cleared')
+        .on('postgres_changes', {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'grocery_items',
+          filter: `user_id=eq.${user.id}`,
+        }, () => {
+          fetchItems()
+        })
+        .subscribe()
+    }
+
+    init()
+    return () => { channel?.unsubscribe() }
   }, [])
 
   async function fetchItems() {
@@ -35,6 +58,10 @@ export default function GroceryList() {
       .order('added_at', { ascending: false })
     setItems(data ?? [])
     setLoading(false)
+  }
+
+  async function handleRefresh() {
+    await fetchItems()
   }
 
   async function fetchNextShop() {
@@ -141,6 +168,7 @@ export default function GroceryList() {
           keyExtractor={item => item.id}
           contentContainerStyle={styles.list}
           showsVerticalScrollIndicator={false}
+          refreshControl={<RefreshControl refreshing={false} onRefresh={handleRefresh} tintColor={colors.primary} />}
           ListEmptyComponent={
             !loading ? (
               <View style={styles.empty}>

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, TouchableOpacity, FlatList,
-  StyleSheet, SafeAreaView, Image, Alert, Modal, ActivityIndicator, Linking, RefreshControl
+  StyleSheet, SafeAreaView, Image, Alert, Modal, ActivityIndicator, Linking, RefreshControl, Animated
 } from 'react-native'
 import { WebView } from 'react-native-webview'
 import type { WebView as WebViewType } from 'react-native-webview'
@@ -97,10 +97,40 @@ export default function CartScreen() {
   const indexRef = useRef(0)
   const queueRef = useRef<CartItem[]>([])
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const toastAnim = useRef(new Animated.Value(-80)).current
 
   useEffect(() => {
-    fetchLatestCart()
+    let channel: ReturnType<typeof supabase.channel> | null = null
+
+    async function init() {
+      await fetchLatestCart()
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) return
+
+      channel = supabase
+        .channel('cart-ready')
+        .on('postgres_changes', {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'carts',
+          filter: `user_id=eq.${user.id}`,
+        }, () => {
+          fetchLatestCart()
+          showToast()
+        })
+        .subscribe()
+    }
+
+    init()
+    return () => { channel?.unsubscribe() }
   }, [])
+
+  function showToast() {
+    Animated.spring(toastAnim, { toValue: 0, useNativeDriver: true, tension: 80 }).start()
+    setTimeout(() => {
+      Animated.spring(toastAnim, { toValue: -80, useNativeDriver: true }).start()
+    }, 4000)
+  }
 
   async function fetchLatestCart(isRefresh = false) {
     if (!isRefresh) setLoading(true)
@@ -248,6 +278,12 @@ export default function CartScreen() {
     handleDone()
   }
 
+  const Toast = (
+    <Animated.View style={[styles.toast, { transform: [{ translateY: toastAnim }] }]}>
+      <Text style={styles.toastText}>🛒 Your cart is ready!</Text>
+    </Animated.View>
+  )
+
   if (loading) return (
     <SafeAreaView style={styles.container}>
       <View style={styles.center}><Text style={styles.loadingText}>Loading cart...</Text></View>
@@ -256,6 +292,7 @@ export default function CartScreen() {
 
   if (!cart || cart.items.length === 0) return (
     <SafeAreaView style={styles.container}>
+      {Toast}
       <View style={styles.header}><Text style={styles.title}>Cart</Text></View>
       <View style={styles.center}>
         <Text style={styles.emptyIcon}>🛒</Text>
@@ -272,6 +309,7 @@ export default function CartScreen() {
 
   return (
     <SafeAreaView style={styles.container}>
+      {Toast}
       <View style={styles.header}>
         <View>
           <Text style={styles.title}>Your Cart</Text>
@@ -525,6 +563,24 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   checkoutBtnText: { color: '#fff', fontSize: font.size.md, fontWeight: '700' },
+  toast: {
+    position: 'absolute',
+    top: 0,
+    left: spacing.lg,
+    right: spacing.lg,
+    zIndex: 100,
+    backgroundColor: colors.primary,
+    borderRadius: radius.md,
+    paddingVertical: 14,
+    paddingHorizontal: spacing.lg,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 8,
+  },
+  toastText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
   modalContainer: { flex: 1, backgroundColor: colors.background },
   addHeader: {
     backgroundColor: colors.card,

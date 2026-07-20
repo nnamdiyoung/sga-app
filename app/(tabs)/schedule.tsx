@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import {
   View, Text, TouchableOpacity, StyleSheet,
-  SafeAreaView, ScrollView, Switch, Alert
+  SafeAreaView, ScrollView, Switch, Alert, ActivityIndicator
 } from 'react-native'
 import { supabase } from '../../lib/supabase'
 import { colors, spacing, radius, font } from '../../lib/theme'
@@ -23,6 +23,8 @@ export default function Schedule() {
   const [saving, setSaving] = useState(false)
   const [scheduleId, setScheduleId] = useState<string | null>(null)
   const [shopping, setShopping] = useState(false)
+  const [agentRunning, setAgentRunning] = useState(false)
+  const [cartReady, setCartReady] = useState(false)
 
   useEffect(() => {
     loadSchedule()
@@ -47,11 +49,32 @@ export default function Schedule() {
     try {
       const { error } = await supabase.functions.invoke('trigger-shopping-agent')
       if (error) throw error
-      Alert.alert('Shopping started!', 'Your cart will be ready in about 2 minutes. Check the Cart tab.')
+      setAgentRunning(true)
+      setCartReady(false)
+      startWatchingForCart()
     } catch {
       Alert.alert('Error', 'Could not start shopping. Please try again.')
     }
     setShopping(false)
+  }
+
+  function startWatchingForCart() {
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      if (!user) return
+      const channel = supabase
+        .channel('schedule-cart-watch')
+        .on('postgres_changes', {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'carts',
+          filter: `user_id=eq.${user.id}`,
+        }, () => {
+          setAgentRunning(false)
+          setCartReady(true)
+          channel.unsubscribe()
+        })
+        .subscribe()
+    })
   }
 
   function toggleDay(day: number) {
@@ -102,17 +125,28 @@ export default function Schedule() {
         </View>
 
         <View style={[styles.card, styles.shopNowCard]}>
-          <View>
-            <Text style={styles.shopNowTitle}>Shop Now</Text>
-            <Text style={styles.shopNowSub}>Run SGA immediately, skipping the schedule</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.shopNowTitle}>
+              {cartReady ? '✅ Cart is ready!' : agentRunning ? '⏳ Shopping in progress...' : 'Shop Now'}
+            </Text>
+            <Text style={styles.shopNowSub}>
+              {cartReady
+                ? 'Go to the Cart tab to review and add to Instacart'
+                : agentRunning
+                ? 'Finding the best products for your list (~2 min)'
+                : 'Run SGA immediately, skipping the schedule'}
+            </Text>
           </View>
-          <TouchableOpacity
-            style={[styles.shopNowBtn, shopping && styles.shopNowBtnDisabled]}
-            onPress={shopNow}
-            disabled={shopping}
-          >
-            <Text style={styles.shopNowBtnText}>{shopping ? 'Starting...' : 'Shop Now'}</Text>
-          </TouchableOpacity>
+          {!agentRunning && !cartReady && (
+            <TouchableOpacity
+              style={[styles.shopNowBtn, shopping && styles.shopNowBtnDisabled]}
+              onPress={shopNow}
+              disabled={shopping}
+            >
+              <Text style={styles.shopNowBtnText}>{shopping ? 'Starting...' : 'Shop Now'}</Text>
+            </TouchableOpacity>
+          )}
+          {agentRunning && <ActivityIndicator color={colors.primary} />}
         </View>
 
         <View style={styles.card}>
