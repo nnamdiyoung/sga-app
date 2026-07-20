@@ -50,4 +50,5 @@ export type UserProfile = {
   brands: string[]
   instacart_email: string
   instacart_password: string
+  github_token?: string
 }
