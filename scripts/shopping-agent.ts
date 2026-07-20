@@ -37,6 +37,7 @@ interface ProductResult {
   url: string;
   store: string;
   itemId?: string;
+  productId?: string;
 }
 
 interface SelectedProduct {
@@ -216,8 +217,10 @@ async function searchInstacart(page: Page, item: string): Promise<ProductResult[
           const image = p.image_url ?? p.image ?? p.photo ?? p.imageUrl ?? "";
           const productUrl = p.url ?? p.product_url ?? p.productUrl ?? "";
           const itemId: string = p.id ?? p.item_id ?? p.itemId ?? "";
-          if (pname && price > 0 && results.length < 5) {
-            results.push({ name: pname, price, image, url: productUrl, store: "Instacart", itemId });
+          const productId: string = String(p.productId ?? p.legacyId ?? p.legacy_id ?? "");
+          // Accept items without price — real price scraped from product page later
+          if (pname && results.length < 5) {
+            results.push({ name: pname, price, image, url: productUrl, store: "Instacart", itemId, productId });
           }
         }
       }
@@ -272,21 +275,43 @@ async function searchOpenFoodFacts(item: string): Promise<ProductResult[]> {
   }
 }
 
-async function addToInstacartCart(page: Page, product: ProductResult): Promise<boolean> {
+async function addToInstacartCart(page: Page, product: ProductResult): Promise<{ added: boolean; price: number }> {
   try {
-    // Build the product page URL from itemId ("items_151403-27268427" → numeric suffix)
-    let productPageUrl = product.url;
-    if (!productPageUrl && product.itemId) {
+    // Build direct product page URL using productId or numeric suffix of itemId
+    let productPageUrl = "";
+    if (product.productId) {
+      productPageUrl = `https://www.instacart.ca/products/${product.productId}`;
+    } else if (product.itemId) {
       const match = product.itemId.match(/(\d+)$/);
       if (match) productPageUrl = `https://www.instacart.ca/products/${match[1]}`;
+    } else if (product.url && product.url.startsWith("http") && !product.url.includes("/store/s?")) {
+      productPageUrl = product.url;
     }
 
-    if (productPageUrl && productPageUrl.startsWith("http") && !productPageUrl.includes("/store/s?")) {
+    if (productPageUrl) {
       console.log(`Navigating to product page: ${productPageUrl}`);
       await page.goto(productPageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
       await page.waitForTimeout(4000);
       await saveScreenshot(page, `product-page-${product.name.substring(0, 15).replace(/\s/g, "_")}`);
     }
+
+    // Scrape real price from the product page
+    let scrapedPrice = product.price;
+    try {
+      const priceText = await page.evaluate(() => {
+        const candidates = document.querySelectorAll('[class*="price" i],[data-testid*="price" i],[aria-label*="price" i]');
+        for (const el of Array.from(candidates)) {
+          const text = el.textContent?.trim() ?? "";
+          const match = text.match(/\$\s*(\d+\.?\d*)/);
+          if (match) return parseFloat(match[1]);
+        }
+        return null;
+      });
+      if (priceText && priceText > 0) {
+        scrapedPrice = priceText;
+        console.log(`Scraped real price for "${product.name}": $${scrapedPrice}`);
+      }
+    } catch { /* non-fatal */ }
 
     // Try multiple selector patterns for the "Add to cart" button
     const addSelectors = [
@@ -310,16 +335,16 @@ async function addToInstacartCart(page: Page, product: ProductResult): Promise<b
           await page.waitForTimeout(2000);
           await saveScreenshot(page, `after-add-${product.name.substring(0, 15).replace(/\s/g, "_")}`);
           console.log(`Added "${product.name}" to Instacart cart (selector: ${sel})`);
-          return true;
+          return { added: true, price: scrapedPrice };
         }
       } catch { continue; }
     }
 
-    console.log(`Could not find Add button for "${product.name}" — screenshots saved`);
-    return false;
+    console.log(`Could not find Add button for "${product.name}"`);
+    return { added: false, price: scrapedPrice };
   } catch (err) {
     console.log(`addToInstacartCart error for "${product.name}": ${err}`);
-    return false;
+    return { added: false, price: product.price };
   }
 }
 
@@ -471,16 +496,18 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
       const chosen = results[idx];
       console.log(`Picked: ${chosen.name} @ $${chosen.price} (${chosen.store})`);
 
-      // Add to the actual Instacart cart
+      // Add to the actual Instacart cart and get real price
+      let finalPrice = chosen.price;
       if (chosen.store === "Instacart") {
-        const added = await addToInstacartCart(page, chosen);
+        const { added, price } = await addToInstacartCart(page, chosen);
         if (added) instacartItemsAdded++;
+        if (price > 0) finalPrice = price;
       }
 
       selectedProducts.push({
         grocery_item_name: item.name,
         product_name: chosen.name,
-        price: chosen.price,
+        price: finalPrice,
         image_url: chosen.image,
         product_url: chosen.url,
         store: chosen.store,
