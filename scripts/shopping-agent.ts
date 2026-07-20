@@ -523,7 +523,6 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   const page = await context.newPage();
 
   const selectedProducts: SelectedProduct[] = [];
-  let instacartItemsAdded = 0;
 
   for (const item of items) {
     console.log(`\n--- Shopping for: ${item.name} ---`);
@@ -553,22 +552,21 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
       const chosen = results[idx];
       console.log(`Picked: ${chosen.name} @ $${chosen.price} (${chosen.store})`);
 
-      // Add to the actual Instacart cart, get real price + product image
-      let finalPrice = chosen.price;
-      let finalImage = chosen.image;
-      if (chosen.store === "Instacart") {
-        const { added, price, image } = await addToInstacartCart(page, chosen, item.quantity);
-        if (added) instacartItemsAdded++;
-        if (price > 0) finalPrice = price;
-        if (image) finalImage = image;
+      // Build a direct Instacart product page URL so the app can add to cart in-app
+      let productUrl = chosen.url;
+      if (chosen.store === "Instacart" && chosen.productId) {
+        productUrl = `https://www.instacart.ca/products/${chosen.productId}`;
+      } else if (chosen.store === "Instacart" && chosen.itemId) {
+        const match = chosen.itemId.match(/(\d+)$/);
+        if (match) productUrl = `https://www.instacart.ca/products/${match[1]}`;
       }
 
       selectedProducts.push({
         grocery_item_name: item.name,
         product_name: chosen.name,
-        price: finalPrice,
-        image_url: finalImage,
-        product_url: chosen.url,
+        price: chosen.price,
+        image_url: chosen.image,
+        product_url: productUrl,
         store: chosen.store,
         swapped: false,
       });
@@ -599,7 +597,6 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
     .map((p) => `<li><strong>${p.grocery_item_name}</strong> → ${p.product_name} ($${p.price.toFixed(2)} CAD)</li>`)
     .join("\n");
 
-  const instacartReady = instacartItemsAdded > 0;
   await resend.emails.send({
     from: "onboarding@resend.dev",
     to: userEmail,
@@ -608,10 +605,7 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
       <h2>Your SGA cart is ready!</h2>
       <p><strong>${selectedProducts.length} items</strong>, approximately <strong>$${total.toFixed(2)} CAD</strong>.</p>
       <ul>${itemListHtml}</ul>
-      ${instacartReady
-        ? `<p>✅ <strong>${instacartItemsAdded} item${instacartItemsAdded > 1 ? 's' : ''} added to your Instacart cart.</strong> Just open Instacart and go to checkout.</p>`
-        : `<p>Open the SGA app to review your cart and complete checkout on Instacart.</p>`
-      }
+      <p>Open the SGA app, go to the Cart tab, and tap <strong>Add to Instacart Cart</strong> — the app will add everything for you. Then just checkout on Instacart.</p>
     `,
   });
 
