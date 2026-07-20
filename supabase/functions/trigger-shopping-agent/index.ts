@@ -44,8 +44,7 @@ Deno.serve(async (req) => {
   }
 
   const text = await res.text()
-  return new Response(JSON.stringify({ success: false, error: text }), {
-    status: 500,
+  return new Response(JSON.stringify({ success: false, error: `GitHub ${res.status}: ${text}` }), {
     headers: { 'Content-Type': 'application/json' },
   })
 })

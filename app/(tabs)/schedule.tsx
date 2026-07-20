@@ -68,16 +68,28 @@ export default function Schedule() {
     setShopping(true)
     setPickingStore(false)
     try {
-      const { error } = await supabase.functions.invoke('trigger-shopping-agent', {
+      const { data, error } = await supabase.functions.invoke('trigger-shopping-agent', {
         body: { store_slug: selectedStore },
       })
-      if (error) throw error
+      if (error) {
+        Alert.alert('Error', error.message ?? 'Could not start shopping.')
+        setPickingStore(true)
+        setShopping(false)
+        return
+      }
+      if (!data?.success) {
+        Alert.alert('Error', data?.error ?? 'Could not start shopping.')
+        setPickingStore(true)
+        setShopping(false)
+        return
+      }
       setRunningStoreName(storeLabel(selectedStore))
       setAgentRunning(true)
       setCartReady(false)
       startWatchingForCart()
-    } catch {
-      Alert.alert('Error', 'Could not start shopping. Please try again.')
+    } catch (e: any) {
+      Alert.alert('Error', e?.message ?? 'Could not start shopping.')
+      setPickingStore(true)
     }
     setShopping(false)
   }
