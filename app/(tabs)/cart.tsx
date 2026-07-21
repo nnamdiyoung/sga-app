@@ -55,18 +55,39 @@ true;
 
 // ---------------------------------------------------------------------------
 // Build the JS that fires the UpdateCartItemsMutation for all items at once.
-// itemId strategy (in order):
-//   1. ctx.v4ids[productId]  — captured from Instacart's own page-load API calls
-//   2. "items_" + ctx.lid + "-" + productId  — constructed from lid + URL productId
-// No HTML fetches — those hang because Instacart returns JS-rendered pages.
+// itemId strategy:
+//   1. Search /store/{slug}/search_v3?q={name} from the WebView (user's location)
+//      and extract the first v4ItemId from the SSR HTML — correct for user's store
+//   2. Fall back to ctx.v4ids[productId] captured from page-load API calls
+//   3. Last resort: construct "items_" + ctx.lid + "-" + productId from URL
 // ---------------------------------------------------------------------------
-function makeAddJS(items: { productUrl: string; qty: number }[]): string {
+function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): string {
   return `(function(items){
   var ctx=window.__ctx;var f=window.__f||window.fetch;
 
   function getProductId(url){
     var m=url.match(/\\/products\\/(\\d+)/);
     return m?m[1]:null;
+  }
+  function getSlug(url){
+    var m=url.match(/\\/store\\/([^/]+)\\//);
+    return m?m[1]:null;
+  }
+
+  // Fetch search page HTML (authenticated, so correct location) and extract first v4ItemId.
+  // 6-second timeout prevents hanging on slow/blocked responses.
+  function searchForId(slug,name,cb){
+    var done=false;
+    var timer=setTimeout(function(){if(!done){done=true;cb(null);}},6000);
+    f('/store/'+slug+'/search_v3?q='+encodeURIComponent(name),{
+      credentials:'include',
+      headers:{Accept:'text/html,*/*','Cache-Control':'no-cache'}
+    }).then(function(r){return r.text();}).then(function(html){
+      if(done)return;done=true;clearTimeout(timer);
+      // Extract first v4ItemId from server-side rendered HTML
+      var m=html.match(/"v4ItemId":"(items_[^"]+)"/);
+      cb(m?m[1]:null);
+    }).catch(function(){if(!done){done=true;clearTimeout(timer);cb(null);}});
   }
 
   function addToCart(pairs){
@@ -89,30 +110,41 @@ function makeAddJS(items: { productUrl: string; qty: number }[]): string {
       var updatedIds=(d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.updatedItemIds)||[];
       var errMsg=d.errors?d.errors[0].message:null;
       var ids=pairs.map(function(p){return p.id;});
-      var debug='lid='+ctx.lid+' v4keys='+JSON.stringify(Object.keys(ctx.v4ids).slice(0,4))+' ids='+JSON.stringify(ids.slice(0,2))+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,200);
+      var debug='lid='+ctx.lid+' searchIds='+JSON.stringify(ids.slice(0,2))+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,250);
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:!!c,count:c?c.itemCount:0,added:updatedIds.length,err:errMsg,debug:debug}));
     }).catch(function(e){
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:String(e),debug:'catch:'+String(e)}));
     });
   }
 
-  function resolveAndAdd(){
-    var pairs=[];
-    items.forEach(function(item){
-      var pid=getProductId(item.productUrl);
-      if(!pid) return;
-      var id=ctx.v4ids[pid]||('items_'+ctx.lid+'-'+pid);
-      pairs.push({id:id,qty:item.qty});
+  function resolveAndAdd(slug){
+    var results=new Array(items.length).fill(null);
+    var pending=items.length;
+    items.forEach(function(item,i){
+      searchForId(slug,item.name,function(v4id){
+        results[i]=v4id;
+        pending--;
+        if(pending===0){
+          var pairs=items.map(function(it,j){
+            if(results[j])return{id:results[j],qty:it.qty};
+            var pid=getProductId(it.productUrl);
+            var fallback=ctx.v4ids[pid]||(pid?('items_'+ctx.lid+'-'+pid):null);
+            return fallback?{id:fallback,qty:it.qty}:null;
+          }).filter(Boolean);
+          if(!pairs.length){
+            window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_product_ids',debug:'lid='+ctx.lid+' slug='+slug}));
+            return;
+          }
+          addToCart(pairs);
+        }
+      });
     });
-    if(!pairs.length){
-      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_product_ids',debug:'lid='+ctx.lid+' urls='+JSON.stringify(items.map(function(x){return x.productUrl;}))}));
-      return;
-    }
-    addToCart(pairs);
   }
 
   var n=0;
+  var slug=null;
   function poll(){
+    if(!slug){for(var i=0;i<items.length;i++){slug=getSlug(items[i].productUrl);if(slug)break;}}
     if(!ctx.lid&&Object.keys(ctx.v4ids).length>0){
       var first=Object.values(ctx.v4ids)[0];
       var lm=first.match(/^items_([^-]+)/);if(lm)ctx.lid=lm[1];
@@ -123,10 +155,10 @@ function makeAddJS(items: { productUrl: string; qty: number }[]): string {
         var m2=nd.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];
       }catch(e){}
     }
-    if(ctx.lid){resolveAndAdd();return;}
+    if(ctx.lid&&slug){resolveAndAdd(slug);return;}
     n++;
     if(n<60)setTimeout(poll,500);
-    else window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:'url='+window.location.href+' v4keys='+JSON.stringify(Object.keys(ctx.v4ids))}));
+    else window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:'url='+window.location.href+' lid='+ctx.lid+' slug='+slug}));
   }
   poll();
 })(${JSON.stringify(items)});
@@ -290,7 +322,7 @@ export default function CartScreen() {
   function startInstacartAdd(cartItems: CartItem[]) {
     const items = cartItems
       .filter(i => !!i.product_url && !i.product_name?.startsWith('Search for "'))
-      .map(i => ({ productUrl: i.product_url, qty: parseQty(i.quantity) }))
+      .map(i => ({ productUrl: i.product_url, qty: parseQty(i.quantity), name: i.grocery_item_name }))
 
     console.log(`[SGA] startInstacartAdd: ${items.length} items with product URLs`)
 
