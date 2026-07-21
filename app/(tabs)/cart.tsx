@@ -58,7 +58,7 @@ function makeAddJS(items: { productId: string; qty: number }[]): string {
       body:JSON.stringify({
         operationName:'UpdateCartItemsMutation',
         variables:{
-          cartId:ctx.cid,
+          cartId:ctx.lid,
           cartItemUpdates:items.map(function(i){return{
             itemId:'items_'+ctx.lid+'-'+i.productId,
             quantity:i.qty,quantityType:'each',
@@ -72,7 +72,7 @@ function makeAddJS(items: { productId: string; qty: number }[]): string {
       var c=d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.cart;
       var updatedIds=(d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.updatedItemIds)||[];
       var errMsg=d.errors?d.errors[0].message:null;
-      var debug=!c?('cid='+ctx.cid+' lid='+ctx.lid+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,200)):null;
+      var debug='cid='+ctx.cid+' lid='+ctx.lid+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,200);
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:!!c,count:c?c.itemCount:0,added:updatedIds.length,err:errMsg,debug:debug}));
     }).catch(function(e){
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:String(e),debug:'catch:'+String(e)}));
