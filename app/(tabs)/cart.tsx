@@ -157,11 +157,17 @@ export default function CartScreen() {
 
   async function removeCartItem(itemId: string) {
     await supabase.from('cart_items').delete().eq('id', itemId)
-    setCart(prev => prev ? {
-      ...prev,
-      items: prev.items.filter(i => i.id !== itemId),
-      total: prev.items.filter(i => i.id !== itemId).reduce((s, i) => s + i.price, 0),
-    } : null)
+    const remaining = (cart?.items ?? []).filter(i => i.id !== itemId)
+    if (remaining.length === 0 && cart) {
+      await supabase.from('carts').delete().eq('id', cart.id)
+      setCart(null)
+    } else {
+      setCart(prev => prev ? {
+        ...prev,
+        items: remaining,
+        total: remaining.reduce((s, i) => s + i.price, 0),
+      } : null)
+    }
   }
 
   async function markCheckedOut() {
