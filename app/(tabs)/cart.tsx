@@ -71,9 +71,11 @@ function makeAddJS(items: { productId: string; qty: number }[]): string {
     }).then(function(r){return r.json();}).then(function(d){
       var c=d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.cart;
       var updatedIds=(d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.updatedItemIds)||[];
-      window.ReactNativeWebView.postMessage(JSON.stringify({ok:!!c,count:c?c.itemCount:0,added:updatedIds.length,err:d.errors?d.errors[0].message:null}));
+      var errMsg=d.errors?d.errors[0].message:null;
+      var debug=!c?('cid='+ctx.cid+' lid='+ctx.lid+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,200)):null;
+      window.ReactNativeWebView.postMessage(JSON.stringify({ok:!!c,count:c?c.itemCount:0,added:updatedIds.length,err:errMsg,debug:debug}));
     }).catch(function(e){
-      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:String(e)}));
+      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:String(e),debug:'catch:'+String(e)}));
     });
   }
   var n=0;
@@ -287,8 +289,7 @@ export default function CartScreen() {
       const data = JSON.parse(event.nativeEvent.data) as { ok: boolean; count?: number; added?: number; err?: string | null }
       console.log('[SGA] Instacart API result:', JSON.stringify(data))
 
-      if (data.debug) setInstacartDebug(JSON.stringify(data.debug))
-      else if (data.err) setInstacartDebug(data.err)
+      if (!data.ok) setInstacartDebug(data.debug ?? data.err ?? 'no detail')
       if (data.ok) {
         setInstacartCount(data.added ?? data.count ?? pendingItemsRef.current.length)
         setInstacartPhase('done')
