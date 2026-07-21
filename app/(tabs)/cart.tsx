@@ -91,8 +91,6 @@ export default function CartScreen() {
   const [isPageLoading, setIsPageLoading] = useState(false)
   const [needsManual, setNeedsManual] = useState(false)
   const [showFlash, setShowFlash] = useState(false)
-  const [showMultiStoreModal, setShowMultiStoreModal] = useState(false)
-  const [multiStoreSearching, setMultiStoreSearching] = useState(false)
 
   const webViewRef = useRef<WebViewType>(null)
   const addedRef = useRef(0)
@@ -147,14 +145,9 @@ export default function CartScreen() {
       .order('created_at', { ascending: false })
       .limit(1)
       .single()
-    const data = cartData ?? null
-    setCart(data)
+    setCart(cartData ?? null)
     setLoading(false)
     setRefreshing(false)
-    // Prompt multi-store search if cart has unfound items
-    if (data && data.items?.some((i: any) => i.product_name?.startsWith('Search for "'))) {
-      setShowMultiStoreModal(true)
-    }
   }
 
   async function handleRefresh() {
@@ -175,28 +168,6 @@ export default function CartScreen() {
     if (!cart) return
     await supabase.from('carts').update({ status: 'checked_out' }).eq('id', cart.id)
     setCart(null)
-  }
-
-  function unfoundItems() {
-    return cart?.items.filter(i => i.product_name?.startsWith('Search for "')) ?? []
-  }
-
-  async function searchOtherStores() {
-    if (!cart) return
-    setMultiStoreSearching(true)
-    setShowMultiStoreModal(false)
-    const names = unfoundItems().map(i => i.grocery_item_name).join(',')
-    const { error } = await supabase.functions.invoke('trigger-shopping-agent', {
-      body: { item_names: names, cart_id: cart.id },
-    })
-    if (error) {
-      Alert.alert('Error', 'Could not start search. Try again.')
-      setMultiStoreSearching(false)
-    }
-  }
-
-  function declineMultiStore() {
-    setShowMultiStoreModal(false)
   }
 
   function startAddToInstacart() {
@@ -393,38 +364,11 @@ export default function CartScreen() {
         }
       />
 
-      {multiStoreSearching && (
-        <View style={styles.multiStoreBanner}>
-          <ActivityIndicator size="small" color={colors.primary} />
-          <Text style={styles.multiStoreBannerText}>Searching other stores for missing items...</Text>
-        </View>
-      )}
-
       <View style={styles.checkoutBar}>
         <TouchableOpacity style={styles.checkoutBtn} onPress={startAddToInstacart}>
           <Text style={styles.checkoutBtnText}>Add to Instacart Cart</Text>
         </TouchableOpacity>
       </View>
-
-      <Modal visible={showMultiStoreModal} transparent animationType="fade">
-        <View style={styles.multiStoreOverlay}>
-          <View style={styles.multiStoreCard}>
-            <Text style={styles.multiStoreTitle}>Some items weren't found</Text>
-            <Text style={styles.multiStoreSub}>
-              {unfoundItems().map(i => i.grocery_item_name).join(', ')} couldn't be found at {cart?.items[0]?.store ?? 'this store'}.
-              {'\n\n'}Search other stores? You'll have separate checkouts for each store.
-            </Text>
-            <View style={styles.multiStoreActions}>
-              <TouchableOpacity style={styles.multiStoreNo} onPress={declineMultiStore}>
-                <Text style={styles.multiStoreNoText}>No, skip them</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.multiStoreYes} onPress={searchOtherStores}>
-                <Text style={styles.multiStoreYesText}>Yes, search</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
 
       <Modal visible={showAddFlow} animationType="slide" presentationStyle="fullScreen">
         <SafeAreaView style={styles.modalContainer}>
@@ -751,49 +695,4 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   closeDoneBtnText: { fontSize: font.size.sm, color: colors.textSecondary },
-  multiStoreBanner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.sm,
-    backgroundColor: colors.primaryLight,
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.sm,
-    borderTopWidth: 1,
-    borderTopColor: colors.primary,
-  },
-  multiStoreBannerText: { fontSize: font.size.sm, color: colors.primary, fontWeight: '600', flex: 1 },
-  multiStoreOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: spacing.lg,
-  },
-  multiStoreCard: {
-    backgroundColor: colors.card,
-    borderRadius: radius.lg,
-    padding: spacing.lg,
-    width: '100%',
-    gap: spacing.md,
-  },
-  multiStoreTitle: { fontSize: font.size.lg, fontWeight: '800', color: colors.textPrimary },
-  multiStoreSub: { fontSize: font.size.sm, color: colors.textSecondary, lineHeight: 20 },
-  multiStoreActions: { flexDirection: 'row', gap: spacing.sm },
-  multiStoreNo: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: radius.md,
-    borderWidth: 1,
-    borderColor: colors.border,
-    alignItems: 'center',
-  },
-  multiStoreNoText: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '600' },
-  multiStoreYes: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: radius.md,
-    backgroundColor: colors.primary,
-    alignItems: 'center',
-  },
-  multiStoreYesText: { color: '#fff', fontWeight: '700', fontSize: font.size.sm },
 })

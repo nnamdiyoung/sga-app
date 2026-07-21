@@ -134,8 +134,7 @@ async function searchInstacart(
         const productId: string = String(p.productId ?? p.legacyId ?? p.legacy_id ?? "");
         const numericId = productId || itemId.match(/(\d+)$/)?.[1] || "";
         let product_url = p.url ?? p.product_url ?? "";
-        if (storeSlug && numericId) product_url = `https://www.instacart.ca/store/${storeSlug}/product_page/${numericId}`;
-        else if (numericId) product_url = `https://www.instacart.ca/products/${numericId}`;
+        if (numericId) product_url = `https://www.instacart.ca/products/${numericId}`;
 
         results.push({
           name,
@@ -149,25 +148,23 @@ async function searchInstacart(
 
   page.on("response", handler);
 
-  const searchUrl = storeSlug
-    ? `https://www.instacart.ca/store/${storeSlug}/storefront/s?k=${encodeURIComponent(query)}`
-    : `https://www.instacart.ca/store/s?k=${encodeURIComponent(query)}`;
+  // Always use generic URL — store-specific URLs don't reliably trigger API responses
+  // in headless Chrome. We capture the redirected store and use it for product URLs only.
+  const searchUrl = `https://www.instacart.ca/store/s?k=${encodeURIComponent(query)}`;
 
-  let detectedStoreSlug = storeSlug ?? "";
+  let detectedStoreSlug = "";
   try {
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
     await page.waitForTimeout(7000);
-    if (!storeSlug) {
-      const match = page.url().match(/\/store\/([^/?#]+)/);
-      if (match && match[1] !== "s") detectedStoreSlug = match[1];
-    }
+    const match = page.url().match(/\/store\/([^/?#]+)/);
+    if (match && match[1] !== "s") detectedStoreSlug = match[1];
     await saveScreenshot(page, `search-${query.replace(/\s/g, "_").substring(0, 15)}`);
   } catch (err) {
     console.log(`Search navigation error: ${err}`);
   }
 
   page.off("response", handler);
-  console.log(`Search "${query}"${storeSlug ? ` @ ${storeSlug}` : ""} → ${results.length} results`);
+  console.log(`Search "${query}" → ${results.length} results (store: ${detectedStoreSlug || "unknown"})`);
   return { results, detectedStoreSlug };
 }
 
@@ -426,10 +423,11 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   const context = await buildBrowserContext(browser, profile);
   const page = await context.newPage();
 
-  // Determine starting store
-  let lockedStoreSlug = process.env.STORE_SLUG || profile?.preferred_store_slug || "";
+  // Only use explicit workflow dispatch store (Shop Now selection), not profile preference
+  // Profile preference doesn't work reliably since store-specific search URLs fail in headless Chrome
+  let lockedStoreSlug = process.env.STORE_SLUG || "";
   let lockedStoreName = lockedStoreSlug ? slugToStoreName(lockedStoreSlug) : "";
-  if (lockedStoreSlug) console.log(`Starting store: ${lockedStoreName} (${lockedStoreSlug})`);
+  if (lockedStoreSlug) console.log(`Requested store: ${lockedStoreName}`);
 
   const selectedProducts: SelectedProduct[] = [];
 
