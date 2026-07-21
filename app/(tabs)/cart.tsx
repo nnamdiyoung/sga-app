@@ -18,18 +18,28 @@ import type { Cart, CartItem } from '../../lib/types'
 const INSTACART_INTERCEPT_JS = `
 window.__ctx={cid:null,lid:null};
 (function(){
-  var o=window.fetch;window.__f=o;
+  function scan(s){
+    if(!window.__ctx.cid){var m=s.match(/"cartId":"([^"]+)"/);if(m)window.__ctx.cid=m[1];}
+    if(!window.__ctx.lid){var m2=s.match(/"retailerLocationId":"([^"]+)"/);if(m2)window.__ctx.lid=m2[1];}
+    if(!window.__ctx.lid){var m3=s.match(/"v4ItemId":"items_([^-"]+)-/);if(m3)window.__ctx.lid=m3[1];}
+  }
+  var fo=window.fetch;window.__f=fo;
   window.fetch=function(){
-    return o.apply(this,arguments).then(function(r){
-      r.clone().json().then(function(j){
-        var s=JSON.stringify(j);
-        if(!window.__ctx.cid){var m=s.match(/"cartId":"([^"]+)"/);if(m)window.__ctx.cid=m[1];}
-        if(!window.__ctx.lid){var m2=s.match(/"retailerLocationId":"([^"]+)"/);if(m2)window.__ctx.lid=m2[1];}
-        if(!window.__ctx.lid){var m3=s.match(/"v4ItemId":"items_([^-"]+)-/);if(m3)window.__ctx.lid=m3[1];}
-      }).catch(function(){});
+    return fo.apply(this,arguments).then(function(r){
+      r.clone().text().then(function(t){try{scan(t);}catch(e){}}).catch(function(){});
       return r;
     });
   };
+  var XO=window.XMLHttpRequest;
+  window.XMLHttpRequest=function(){
+    var x=new XO();
+    var os=Object.getOwnPropertyDescriptor(XO.prototype,'onreadystatechange');
+    x.addEventListener('readystatechange',function(){
+      if(x.readyState===4){try{scan(x.responseText);}catch(e){}}
+    });
+    return x;
+  };
+  window.XMLHttpRequest.prototype=XO.prototype;
 })();
 true;
 `
@@ -78,8 +88,8 @@ function makeAddJS(items: { productId: string; qty: number }[]): string {
     }
     if(ctx.cid&&ctx.lid){go();return;}
     n++;
-    if(n<24)setTimeout(poll,500);
-    else window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired'}));
+    if(n<60)setTimeout(poll,500);
+    else window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:{cid:ctx.cid,lid:ctx.lid,url:window.location.href}}));
   }
   poll();
 })(${JSON.stringify(items)});
@@ -118,6 +128,7 @@ export default function CartScreen() {
   const [instacartPhase, setInstacartPhase] = useState<'idle' | 'loading' | 'adding' | 'done' | 'error'>('idle')
   const [instacartCount, setInstacartCount] = useState(0)
   const [showInstacartFlow, setShowInstacartFlow] = useState(false)
+  const [instacartDebug, setInstacartDebug] = useState<string | null>(null)
   const [webViewKey, setWebViewKey] = useState(0)
   const [instacartUrl, setInstacartUrl] = useState('https://www.instacart.ca')
 
@@ -253,12 +264,10 @@ export default function CartScreen() {
 
     if (items.length === 0) return
 
-    // Use a store-specific URL so Instacart makes cart API calls immediately
-    const firstUrl = cartItems.find(i => i.product_url?.includes('/store/'))?.product_url ?? ''
-    const storeSlugMatch = firstUrl.match(/\/store\/([^/?#]+)/)
-    const storeUrl = storeSlugMatch
-      ? `https://www.instacart.ca/store/${storeSlugMatch[1]}`
-      : 'https://www.instacart.ca'
+    // Load a specific product URL — product pages always trigger cart-state API
+    // calls (to show Add vs In Cart), which contain cartId + retailerLocationId
+    const firstProductUrl = cartItems.find(i => i.product_url?.includes('/store/'))?.product_url
+    const storeUrl = firstProductUrl ?? 'https://www.instacart.ca'
 
     pendingItemsRef.current = items
     setInstacartUrl(storeUrl)
@@ -278,6 +287,7 @@ export default function CartScreen() {
       const data = JSON.parse(event.nativeEvent.data) as { ok: boolean; count?: number; added?: number; err?: string | null }
       console.log('[SGA] Instacart API result:', JSON.stringify(data))
 
+      if (data.debug) setInstacartDebug(JSON.stringify(data.debug))
       if (data.ok) {
         setInstacartCount(data.added ?? data.count ?? pendingItemsRef.current.length)
         setInstacartPhase('done')
@@ -488,6 +498,7 @@ export default function CartScreen() {
                 <Text style={styles.instacartEmoji}>⚠️</Text>
                 <Text style={styles.instacartTitle}>Could not connect to Instacart</Text>
                 <Text style={styles.instacartSub}>Your session may have expired. Reconnect your account in Profile and try again.</Text>
+                {instacartDebug && <Text style={styles.debugText}>{instacartDebug}</Text>}
                 <TouchableOpacity
                   style={styles.openBtn}
                   onPress={() => {
@@ -729,4 +740,5 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   closeBtnText: { fontSize: font.size.sm, color: colors.textSecondary },
+  debugText: { fontSize: 10, color: colors.textMuted, textAlign: 'center', marginTop: spacing.sm },
 })
