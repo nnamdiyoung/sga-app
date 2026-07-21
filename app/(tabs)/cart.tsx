@@ -51,10 +51,13 @@ true;
 // ---------------------------------------------------------------------------
 // Build the JS that fires the UpdateCartItemsMutation for all items at once.
 // ---------------------------------------------------------------------------
-function makeAddJS(items: { productId: string; qty: number }[]): string {
+function makeAddJS(items: { savedItemId: string | null; productId: string | null; qty: number }[]): string {
   return `(function(items){
   var ctx=window.__ctx;var f=window.__f||window.fetch;
   function go(){
+    // Derive cartId from the first item's lid (saved itemId encodes the correct location)
+    var firstItemId=items[0].savedItemId||('items_'+ctx.lid+'-'+items[0].productId);
+    var cartLid=firstItemId.split('-')[0].replace('items_','');
     f('/graphql?operationName=UpdateCartItemsMutation',{
       method:'POST',
       headers:{'Content-Type':'application/json','x-client-identifier':'web'},
@@ -62,9 +65,9 @@ function makeAddJS(items: { productId: string; qty: number }[]): string {
       body:JSON.stringify({
         operationName:'UpdateCartItemsMutation',
         variables:{
-          cartId:ctx.lid,
+          cartId:cartLid,
           cartItemUpdates:items.map(function(i){return{
-            itemId:'items_'+ctx.lid+'-'+i.productId,
+            itemId:i.savedItemId||('items_'+ctx.lid+'-'+i.productId),
             quantity:i.qty,quantityType:'each',
             trackingParams:{attributionMetadata:{shopId:'',nestedShopId:''},trackingProperties:{}}
           };}),
@@ -76,7 +79,7 @@ function makeAddJS(items: { productId: string; qty: number }[]): string {
       var c=d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.cart;
       var updatedIds=(d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.updatedItemIds)||[];
       var errMsg=d.errors?d.errors[0].message:null;
-      var debug='cid='+ctx.cid+' lid='+ctx.lid+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,200);
+      var debug='cartLid='+cartLid+' lid='+ctx.lid+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,200);
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:!!c,count:c?c.itemCount:0,added:updatedIds.length,err:errMsg,debug:debug}));
     }).catch(function(e){
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:String(e),debug:'catch:'+String(e)}));
@@ -257,14 +260,18 @@ export default function CartScreen() {
   // Instacart GraphQL flow
   // ---------------------------------------------------------------------------
   function startInstacartAdd(cartItems: CartItem[]) {
+    const ITEM_ID_RE = /^items_\d+-\d+$/
     const items = cartItems
       .filter(i => !!i.product_url && !i.product_name?.startsWith('Search for "'))
       .map(i => {
-        const productId = extractProductId(i.product_url)
-        if (!productId) console.warn('[SGA] No productId from URL:', i.product_url)
-        return productId ? { productId, qty: parseQty(i.quantity) } : null
+        // Prefer the full instacart_item_id saved by the agent (already has the correct lid+productId)
+        const savedItemId = i.instacart_item_id && ITEM_ID_RE.test(i.instacart_item_id)
+          ? i.instacart_item_id : null
+        const productId = savedItemId ? null : extractProductId(i.product_url)
+        if (!savedItemId && !productId) console.warn('[SGA] No itemId or productId for:', i.grocery_item_name)
+        return (savedItemId || productId) ? { savedItemId, productId, qty: parseQty(i.quantity) } : null
       })
-      .filter((i): i is { productId: string; qty: number } => i !== null)
+      .filter((i): i is { savedItemId: string | null; productId: string | null; qty: number } => i !== null)
 
     console.log(`[SGA] startInstacartAdd: ${items.length} of ${cartItems.length} items have valid productIds`)
 

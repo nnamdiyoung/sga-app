@@ -293,6 +293,9 @@ Use your judgment. Be decisive.`,
     },
   ];
 
+  // Map product_url → instacart_item_id so we don't rely on Claude echoing it back
+  const itemIdByUrl = new Map<string, string>();
+
   let finalSelections: SelectedProduct[] = [];
   let isDone = false;
 
@@ -317,6 +320,11 @@ Use your judgment. Be decisive.`,
         const { query } = block.input as { query: string };
         const { results, detectedStoreSlug } = await searchInstacart(page, query);
         const storeName = detectedStoreSlug ? slugToStoreName(detectedStoreSlug) : "Instacart";
+
+        // Store itemIds by URL so we can look them up at finalize time
+        for (const r of results) {
+          if (r.product_url && r.instacart_item_id) itemIdByUrl.set(r.product_url, r.instacart_item_id);
+        }
 
         const resultText = results.length > 0
           ? `Found ${results.length} products at ${storeName}:\n` +
@@ -353,7 +361,8 @@ Use your judgment. Be decisive.`,
             store: s.store,
             swapped: false,
             quantity: original?.quantity ?? "1",
-            instacart_item_id: s.instacart_item_id ?? '',
+            // Look up directly from search results — don't trust Claude's echo of the ID
+            instacart_item_id: itemIdByUrl.get(s.product_url) ?? s.instacart_item_id ?? '',
           };
         });
 

@@ -40,6 +40,7 @@ export type CartItem = {
   store: string
   swapped: boolean
   quantity?: string
+  instacart_item_id?: string
 }
 
 export type UserProfile = {
