@@ -557,7 +557,13 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   for (const item of items) {
     console.log(`\n--- Shopping for: ${item.name} ---`);
 
-    const { results: instacartResults, storeSlug, storeName } = await searchInstacart(page, item.name, lockedStoreSlug || undefined);
+    let { results: instacartResults, storeSlug, storeName } = await searchInstacart(page, item.name, lockedStoreSlug || undefined);
+
+    // If store-specific URL returned nothing, fall back to generic URL (auto-redirect works better in headless)
+    if (instacartResults.length === 0 && lockedStoreSlug) {
+      console.log(`Store-specific search returned 0, retrying with generic URL...`);
+      ({ results: instacartResults, storeSlug, storeName } = await searchInstacart(page, item.name));
+    }
 
     // Lock store after first successful Instacart search
     if (!lockedStoreSlug && storeSlug) {
