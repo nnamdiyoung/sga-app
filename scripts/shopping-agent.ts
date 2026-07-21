@@ -168,89 +168,86 @@ async function searchInstacart(
   return { results, detectedStoreSlug };
 }
 
-// ─── Agentic item shopper ──────────────────────────────────────────────────
+// ─── Agentic full-basket shopper ─────────────────────────────────────────────
 
 const SHOPPING_TOOLS: Anthropic.Tool[] = [
   {
     name: "search_instacart",
-    description: "Search Instacart for a product. Returns matching products with names, prices, and URLs. If results are empty, try a shorter or different search term. You can also omit store_slug to let Instacart auto-select the best store.",
+    description: "Search Instacart for a product. Returns products with names, prices, URLs, and which store they're from. If you get 0 results, try a shorter or simpler search term.",
     input_schema: {
       type: "object" as const,
       properties: {
-        query: { type: "string", description: "Product search query" },
-        store_slug: { type: "string", description: "Store slug to search in (optional, leave empty to auto-detect)" },
+        query: { type: "string", description: "Search query (e.g. 'eggs', 'brioche', 'paper towels')" },
       },
       required: ["query"],
     },
   },
   {
-    name: "select_product",
-    description: "Select the best product you found for this grocery item. Call this once you've found a good match.",
+    name: "finalize_cart",
+    description: "Submit your final product selections for the entire grocery list. Call this once you've found products for all items (or exhausted searches).",
     input_schema: {
       type: "object" as const,
       properties: {
-        product_name: { type: "string" },
-        price: { type: "number", description: "Price in CAD. Estimate a realistic price if 0." },
-        product_url: { type: "string", description: "Product URL from search results" },
-        image_url: { type: "string", description: "Product image URL (can be empty)" },
-        store: { type: "string", description: "Store name (e.g. Walmart, Loblaws)" },
-        reason: { type: "string", description: "Brief reason for your choice" },
+        selections: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              grocery_item_name: { type: "string", description: "Original grocery list item name" },
+              product_name: { type: "string", description: "Exact product name found" },
+              price: { type: "number", description: "Price in CAD (estimate if shown as 0)" },
+              product_url: { type: "string", description: "Product URL from search results" },
+              image_url: { type: "string", description: "Image URL (empty string if none)" },
+              store: { type: "string", description: "Store name" },
+              not_found: { type: "boolean", description: "True if item couldn't be found after trying" },
+            },
+            required: ["grocery_item_name", "product_name", "price", "product_url", "image_url", "store", "not_found"],
+          },
+        },
       },
-      required: ["product_name", "price", "product_url", "store", "reason"],
-    },
-  },
-  {
-    name: "mark_not_found",
-    description: "Mark this item as not found after trying multiple searches. Only use after at least 2 search attempts.",
-    input_schema: {
-      type: "object" as const,
-      properties: {
-        reason: { type: "string" },
-      },
-      required: ["reason"],
+      required: ["selections"],
     },
   },
 ];
 
-async function shopForItem(
+async function shopForGroceries(
   page: Page,
-  item: GroceryItem,
+  items: GroceryItem[],
   profile: Profile,
-  lockedStoreSlug: string,
-  lockedStoreName: string
-): Promise<{ product: SelectedProduct | null; storeSlug: string; storeName: string }> {
+): Promise<SelectedProduct[]> {
+  const itemList = items.map(i => `- ${i.name} (qty: ${i.quantity})`).join("\n");
+
   const messages: Anthropic.MessageParam[] = [
     {
       role: "user",
-      content: `You are a smart grocery shopping assistant. Find the best product on Instacart for:
+      content: `You are a smart grocery shopper. Buy the following items on Instacart Canada:
 
-Item: "${item.name}"
-Quantity needed: ${item.quantity}
-Budget: $${profile.budget ?? "flexible"} CAD total shop
-Dietary: ${profile.dietary?.join(", ") || "none"}
-Allergies: ${profile.allergies?.join(", ") || "none"}
-Preferred brands: ${profile.brands || "no preference"}
-${lockedStoreSlug ? `Store: ${lockedStoreName} (${lockedStoreSlug}) — search here first` : "Store: auto-detect (let Instacart choose)"}
+${itemList}
 
-Instructions:
-- Use search_instacart to find options
-- If 0 results, try a simpler/shorter search term (e.g. "brioche bread" → "brioche", "paper towel" → "paper towels")
-- If still 0 results without a store slug, try without store_slug to let Instacart auto-select
-- Pick the best value product that matches the item and user preferences
-- Use select_product with the chosen product's URL from the results
-- Only use mark_not_found if you've genuinely exhausted search options`,
+User preferences:
+- Budget: $${profile.budget ?? "flexible"} CAD
+- Dietary: ${profile.dietary?.join(", ") || "none"}
+- Allergies: ${profile.allergies?.join(", ") || "none"}
+- Preferred brands: ${profile.brands || "no strong preference"}
+
+Be smart about this:
+- Try to get everything from one store — it's better for the user (one checkout)
+- But don't skip an item just to stay in one store; finding the item matters more
+- If a search returns nothing, try a shorter or different term before giving up
+- Pick good value products that match the user's preferences and dietary needs
+- Once you have everything (or have genuinely tried), call finalize_cart with all your selections
+
+Search however makes sense to you. Use your judgment.`,
     },
   ];
 
-  let currentStoreSlug = lockedStoreSlug;
-  let currentStoreName = lockedStoreName;
-  let selectedProduct: SelectedProduct | null = null;
+  let finalSelections: SelectedProduct[] = [];
   let isDone = false;
 
-  for (let turn = 0; turn < 6 && !isDone; turn++) {
+  for (let turn = 0; turn < 20 && !isDone; turn++) {
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
-      max_tokens: 1024,
+      max_tokens: 2048,
       tools: SHOPPING_TOOLS,
       messages,
     });
@@ -265,64 +262,49 @@ Instructions:
       if (block.type !== "tool_use") continue;
 
       if (block.name === "search_instacart") {
-        const input = block.input as { query: string; store_slug?: string };
-        const slug = input.store_slug || currentStoreSlug || undefined;
-        const { results, detectedStoreSlug } = await searchInstacart(page, input.query, slug);
-
-        // Capture store from first successful search
-        if (!currentStoreSlug && detectedStoreSlug) {
-          currentStoreSlug = detectedStoreSlug;
-          currentStoreName = slugToStoreName(detectedStoreSlug);
-          console.log(`Store auto-detected: ${currentStoreName}`);
-        }
+        const { query } = block.input as { query: string };
+        const { results, detectedStoreSlug } = await searchInstacart(page, query);
+        const storeName = detectedStoreSlug ? slugToStoreName(detectedStoreSlug) : "Instacart";
 
         const resultText = results.length > 0
-          ? `Found ${results.length} products at ${currentStoreName || "Instacart"}:\n` +
-            results.map((r, i) => `${i + 1}. ${r.name} — $${r.price} CAD\n   URL: ${r.product_url}\n   Image: ${r.image}`).join("\n")
-          : `No results for "${input.query}" at ${slug ? slugToStoreName(slug) : "auto-detected store"}. Try a different search term or omit store_slug.`;
+          ? `Found ${results.length} products at ${storeName}:\n` +
+            results.map((r, i) =>
+              `${i + 1}. ${r.name} — $${r.price > 0 ? r.price : "price not shown"} CAD | URL: ${r.product_url} | Image: ${r.image}`
+            ).join("\n")
+          : `No results for "${query}". Try a simpler or different search term.`;
 
         toolResults.push({ type: "tool_result", tool_use_id: block.id, content: resultText });
       }
 
-      else if (block.name === "select_product") {
-        const input = block.input as {
-          product_name: string; price: number; product_url: string;
-          image_url?: string; store: string; reason: string;
+      else if (block.name === "finalize_cart") {
+        const { selections } = block.input as {
+          selections: Array<{
+            grocery_item_name: string; product_name: string; price: number;
+            product_url: string; image_url: string; store: string; not_found: boolean;
+          }>;
         };
-        console.log(`✓ "${item.name}" → ${input.product_name} @ $${input.price} (${input.store}) — ${input.reason}`);
-        selectedProduct = {
-          grocery_item_name: item.name,
-          product_name: input.product_name,
-          price: input.price,
-          image_url: input.image_url ?? "",
-          product_url: input.product_url,
-          store: input.store,
-          swapped: false,
-          quantity: item.quantity,
-        };
-        if (!currentStoreName) currentStoreName = input.store;
-        isDone = true;
-        toolResults.push({ type: "tool_result", tool_use_id: block.id, content: "Product saved." });
-      }
 
-      else if (block.name === "mark_not_found") {
-        const input = block.input as { reason: string };
-        console.log(`✗ "${item.name}" not found — ${input.reason}`);
-        // Placeholder so the cart still shows something
-        selectedProduct = {
-          grocery_item_name: item.name,
-          product_name: `Search for "${item.name}"`,
-          price: 0,
-          image_url: "",
-          product_url: currentStoreSlug
-            ? `https://www.instacart.ca/store/${currentStoreSlug}/storefront/s?k=${encodeURIComponent(item.name)}`
-            : `https://www.instacart.ca/store/s?k=${encodeURIComponent(item.name)}`,
-          store: currentStoreName || "Instacart",
-          swapped: false,
-          quantity: item.quantity,
-        };
+        // Map back to SelectedProduct, filling in quantity from original items
+        finalSelections = selections.map((s) => {
+          const original = items.find(i => i.name.toLowerCase() === s.grocery_item_name.toLowerCase());
+          console.log(s.not_found
+            ? `✗ ${s.grocery_item_name} — not found`
+            : `✓ ${s.grocery_item_name} → ${s.product_name} @ $${s.price} (${s.store})`
+          );
+          return {
+            grocery_item_name: s.grocery_item_name,
+            product_name: s.not_found ? `Search for "${s.grocery_item_name}"` : s.product_name,
+            price: s.price,
+            image_url: s.image_url,
+            product_url: s.product_url || `https://www.instacart.ca/store/s?k=${encodeURIComponent(s.grocery_item_name)}`,
+            store: s.store,
+            swapped: false,
+            quantity: original?.quantity ?? "1",
+          };
+        });
+
         isDone = true;
-        toolResults.push({ type: "tool_result", tool_use_id: block.id, content: "Noted." });
+        toolResults.push({ type: "tool_result", tool_use_id: block.id, content: "Cart finalized." });
       }
     }
 
@@ -331,7 +313,7 @@ Instructions:
     }
   }
 
-  return { product: selectedProduct, storeSlug: currentStoreSlug, storeName: currentStoreName };
+  return finalSelections;
 }
 
 // ─── Session setup ────────────────────────────────────────────────────────────
@@ -423,29 +405,11 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   const context = await buildBrowserContext(browser, profile);
   const page = await context.newPage();
 
-  // Only use explicit workflow dispatch store (Shop Now selection), not profile preference
-  // Profile preference doesn't work reliably since store-specific search URLs fail in headless Chrome
-  let lockedStoreSlug = process.env.STORE_SLUG || "";
-  let lockedStoreName = lockedStoreSlug ? slugToStoreName(lockedStoreSlug) : "";
-  if (lockedStoreSlug) console.log(`Requested store: ${lockedStoreName}`);
+  const preferredStore = process.env.STORE_SLUG ? slugToStoreName(process.env.STORE_SLUG) : null;
+  if (preferredStore) console.log(`Store preference: ${preferredStore} (hint only — Claude decides)`);
 
-  const selectedProducts: SelectedProduct[] = [];
-
-  for (const item of items) {
-    console.log(`\n── Shopping for: ${item.name} ──`);
-    const { product, storeSlug, storeName } = await shopForItem(page, item, profile, lockedStoreSlug, lockedStoreName);
-
-    // Lock store after first item
-    if (!lockedStoreSlug && storeSlug) {
-      lockedStoreSlug = storeSlug;
-      lockedStoreName = storeName;
-      console.log(`Store locked: ${lockedStoreName}`);
-    }
-
-    if (product) selectedProducts.push(product);
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-
+  console.log(`\nStarting agentic shop for ${items.length} items...`);
+  const selectedProducts = await shopForGroceries(page, items, profile);
   await context.close();
 
   if (selectedProducts.length === 0) {
