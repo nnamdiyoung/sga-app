@@ -344,7 +344,7 @@ async function addProductWithClaude(page: Page, product: SelectedProduct, worker
     }
 
     for (let attempt = 0; attempt < 4; attempt++) {
-      const screenshot = await page.screenshot({ encoding: "base64" });
+      const screenshot = (await page.screenshot()).toString("base64");
 
       const response = await anthropic.messages.create({
         model: "claude-haiku-4-5-20251001",
@@ -352,7 +352,7 @@ async function addProductWithClaude(page: Page, product: SelectedProduct, worker
         messages: [{
           role: "user",
           content: [
-            { type: "image", source: { type: "base64", media_type: "image/png", data: screenshot as string } },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: screenshot } },
             {
               type: "text",
               text: `Instacart Canada product page. Add "${product.product_name}" to cart.
