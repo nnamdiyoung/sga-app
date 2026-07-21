@@ -16,14 +16,18 @@ import type { Cart, CartItem } from '../../lib/types'
 // retailerLocationId before we inject the mutation.
 // ---------------------------------------------------------------------------
 const INSTACART_INTERCEPT_JS = `
-window.__ctx={cid:null,lid:null,slug:null,lidSaved:false,v4ids:{},searchReq:null,searchOp:'',searchQKey:''};
+window.__ctx={lid:null,slug:null,lidSaved:false,v4ids:{},searchURL:'',fetchCount:0,fetchUrls:[]};
 (function(){
-  function scan(s){
+  function scan(s,url){
     if(!window.__ctx.lid){var m2=s.match(/"retailerLocationId":"([^"]+)"/);if(m2)window.__ctx.lid=m2[1];}
     if(!window.__ctx.slug){var ms=s.match(/"(?:storeSlug|retailerSlug|store_slug)":"([a-z][a-z0-9-]{2,50})"/);if(ms)window.__ctx.slug=ms[1];}
-    // Capture every v4ItemId seen in API responses, keyed by productId
-    var re=/"v4ItemId":"(items_([^-"]+)-([^"]+))"/g;var mx;
+    // Capture v4ItemIds from named fields (v4ItemId, itemId, etc.) AND from bare "id" fields
+    var re=/"(?:v4ItemId|v4_item_id|itemId|item_id)":"(items_([^-"]+)-([^"]+))"/g;var mx;
     while((mx=re.exec(s))!==null){window.__ctx.v4ids[mx[3]]=mx[1];}
+    var re2=/"id":"(items_(\d+)-(\d+))"/g;
+    while((mx=re2.exec(s))!==null){window.__ctx.v4ids[mx[3]]=mx[1];}
+    // Save the URL of the first response that contains items_ IDs — we replay it per item name
+    if(!window.__ctx.searchURL&&url&&s.indexOf('"items_')!==-1){window.__ctx.searchURL=url;}
     if(!window.__ctx.lid&&Object.keys(window.__ctx.v4ids).length>0){
       var first=Object.values(window.__ctx.v4ids)[0];
       var lm=first.match(/^items_([^-]+)/);if(lm)window.__ctx.lid=lm[1];
@@ -35,36 +39,21 @@ window.__ctx={cid:null,lid:null,slug:null,lidSaved:false,v4ids:{},searchReq:null
   }
   var fo=window.fetch;window.__f=fo;
   window.fetch=function(input,init){
-    if(!window.__ctx.searchReq&&init&&init.body){
-      try{
-        var b=String(init.body);
-        if(b.includes('persistedQuery')){
-          var rq=JSON.parse(b);
-          if(rq.operationName&&/search|find/i.test(rq.operationName)&&rq.variables&&rq.extensions&&rq.extensions.persistedQuery){
-            var qkeys=['query','searchTerm','q','term','searchQuery','keyword'];
-            for(var qi=0;qi<qkeys.length;qi++){
-              if(typeof rq.variables[qkeys[qi]]==='string'&&rq.variables[qkeys[qi]].length>0){
-                window.__ctx.searchReq=b;
-                window.__ctx.searchOp=rq.operationName;
-                window.__ctx.searchQKey=qkeys[qi];
-                break;
-              }
-            }
-          }
-        }
-      }catch(e){}
-    }
+    var url=typeof input==='string'?input:(input&&input.url?input.url:'');
+    window.__ctx.fetchCount++;
+    if(window.__ctx.fetchUrls.length<6)window.__ctx.fetchUrls.push(url.substring(0,100));
     return fo.apply(this,arguments).then(function(r){
-      r.clone().text().then(function(t){try{scan(t);}catch(e){}}).catch(function(){});
+      r.clone().text().then(function(t){try{scan(t,url);}catch(e){}}).catch(function(){});
       return r;
     });
   };
   var XO=window.XMLHttpRequest;
   window.XMLHttpRequest=function(){
     var x=new XO();
-    var os=Object.getOwnPropertyDescriptor(XO.prototype,'onreadystatechange');
+    var xhrUrl='';
+    x.open=function(){xhrUrl=String(arguments[1]||'');return XO.prototype.open.apply(x,arguments);};
     x.addEventListener('readystatechange',function(){
-      if(x.readyState===4){try{scan(x.responseText);}catch(e){}}
+      if(x.readyState===4){try{scan(x.responseText,xhrUrl);}catch(e){}}
     });
     return x;
   };
@@ -84,70 +73,82 @@ true;
 //   3. Last resort: construct "items_" + ctx.lid + "-" + productId from stored URL
 // ---------------------------------------------------------------------------
 function makeAddJS(items: { productUrl: string; qty: number; name: string }[], preferredSlug: string): string {
-  return `(function(items, preferredSlug){
+  return `(function(items,preferredSlug){
   var ctx=window.__ctx;var f=window.__f||window.fetch;
 
-  function getProductId(url){
-    var m=url.match(/\\/products\\/(\\d+)/);
-    return m?m[1]:null;
-  }
-
-  // Extract first v4ItemId from any text blob (SSR HTML or JSON)
   function extractV4Id(text){
-    var m=text.match(/"v4ItemId":"(items_[^"]+)"/);
+    var m=text.match(/"(?:v4ItemId|v4_item_id|itemId|item_id)":"(items_[^"]+)"/);
     if(m)return m[1];
-    // Also match bare items_NNN-NNN format in id/itemId fields
-    m=text.match(/"(?:itemId|item_id)":"(items_\\d+-\\d+)"/);
+    m=text.match(/"id":"(items_\\d+-\\d+)"/);
     return m?m[1]:null;
   }
 
-  // Fetch a search page HTML and extract the first v4ItemId at the user's location.
-  // Uses store-specific URL when slug is known (same path as the agent), else generic.
-  function searchForV4Id(name, productUrl, isFirst, cb){
+  // Extract v4ItemId from a JSON object (modules/items/products structure Instacart uses)
+  function extractV4IdFromJSON(d){
+    var candidates=[];
+    try{
+      if(d.modules)for(var mi=0;mi<d.modules.length;mi++){var m=d.modules[mi];var arr=m.items||m.products||[];for(var pi=0;pi<arr.length;pi++)candidates.push(arr[pi]);}
+      if(d.items)for(var ii=0;ii<d.items.length;ii++)candidates.push(d.items[ii]);
+      if(d.products)for(var ip=0;ip<d.products.length;ip++)candidates.push(d.products[ip]);
+      if(d.data&&d.data.search&&d.data.search.products)for(var sp=0;sp<d.data.search.products.length;sp++)candidates.push(d.data.search.products[sp]);
+    }catch(e){}
+    for(var ci=0;ci<candidates.length;ci++){
+      var p=candidates[ci];
+      var pid=String(p.id||p.itemId||p.item_id||p.v4ItemId||p.v4_item_id||'');
+      if(/^items_\\d+-\\d+$/.test(pid))return pid;
+    }
+    return null;
+  }
+
+  // Search for an item by name and return its v4ItemId at the user's location.
+  // Strategy: 1) replay the captured search API URL, 2) HTML fetch as fallback.
+  function searchForV4Id(name,isFirst,cb){
     var done=false;
     var timer=setTimeout(function(){if(!done){done=true;cb(null);}},12000);
+    function finish(v4id){if(!done){done=true;clearTimeout(timer);cb(v4id);}}
 
-    function doFetch(){
+    // For item[0]: if intercept already captured v4ids from the page-load search, use the first one
+    if(isFirst&&Object.keys(ctx.v4ids).length>0){finish(Object.values(ctx.v4ids)[0]);return;}
+
+    // Try replaying the captured search API URL with this item's name
+    if(ctx.searchURL){
       var slug=ctx.slug||preferredSlug||'';
-      var path=slug
-        ?'/store/'+slug+'/search_v3?k='+encodeURIComponent(name)
-        :'/store/s?k='+encodeURIComponent(name);
+      // Replace the term/k/q parameter in the URL
+      var apiUrl=ctx.searchURL.replace(/([?&](?:term|k|q|query|search_term|searchTerm)=)[^&]*/i,'$1'+encodeURIComponent(name));
+      if(apiUrl===ctx.searchURL){apiUrl+=(ctx.searchURL.indexOf('?')>=0?'&':'?')+'term='+encodeURIComponent(name);}
+      f(apiUrl,{credentials:'include',headers:{'Accept':'application/json'}})
+        .then(function(r){return r.json();})
+        .then(function(d){
+          var v4id=extractV4IdFromJSON(d);
+          if(v4id){
+            if(!ctx.lid){var lm=v4id.match(/^items_([^-]+)/);if(lm)ctx.lid=lm[1];}
+            finish(v4id);
+          } else {tryHTML();}
+        })
+        .catch(tryHTML);
+    } else {
+      tryHTML();
+    }
+
+    function tryHTML(){
+      if(done)return;
+      var slug=ctx.slug||preferredSlug||'';
+      var path=slug?'/store/'+slug+'/search_v3?k='+encodeURIComponent(name):'/store/s?k='+encodeURIComponent(name);
       f(path,{credentials:'include'})
         .then(function(r){return r.text();})
         .then(function(html){
-          if(done)return;done=true;clearTimeout(timer);
-          // Update lid/slug from HTML if not yet captured
           if(!ctx.lid){var m2=html.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];}
           if(!ctx.slug){var ms=html.match(/"(?:storeSlug|retailerSlug|store_slug)":"([a-z][a-z0-9-]{2,50})"/);if(ms)ctx.slug=ms[1];}
-          cb(extractV4Id(html));
+          var v4id=extractV4Id(html);
+          if(!v4id){v4id=extractV4IdFromJSON(JSON.parse(html.match(/"__NEXT_DATA__[^>]*>([^<]+)/)?.[1]||'{}'));}
+          finish(v4id);
         })
-        .catch(function(){if(!done){done=true;clearTimeout(timer);cb(null);}});
+        .catch(function(){finish(null);});
     }
-
-    // For item[0] the search page is already loaded — try to read its data without a fetch
-    if(isFirst){
-      try{
-        // 1. ctx.v4ids keyed by productId (captured by intercept from API responses)
-        var pid=getProductId(productUrl||'');
-        if(pid&&ctx.v4ids[pid]){clearTimeout(timer);done=true;cb(ctx.v4ids[pid]);return;}
-        // 2. __NEXT_DATA__ script element (SSR-embedded JSON)
-        var el=document.getElementById('__NEXT_DATA__');
-        if(el){
-          var v4=extractV4Id(el.textContent||el.innerText||'');
-          if(v4){clearTimeout(timer);done=true;cb(v4);return;}
-        }
-      }catch(e){}
-    }
-
-    doFetch();
   }
 
-  function addToCart(pairs,slug){
-    var updates=pairs.map(function(p){return{
-      itemId:p.id,
-      quantity:p.qty,quantityType:'each',
-      trackingParams:{attributionMetadata:{shopId:'',nestedShopId:''},trackingProperties:{}}
-    };});
+  function addToCart(pairs){
+    var updates=pairs.map(function(p){return{itemId:p.id,quantity:p.qty,quantityType:'each',trackingParams:{attributionMetadata:{shopId:'',nestedShopId:''},trackingProperties:{}}};});
     f('/graphql?operationName=UpdateCartItemsMutation',{
       method:'POST',
       headers:{'Content-Type':'application/json','x-client-identifier':'web'},
@@ -162,7 +163,7 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[], p
       var updatedIds=(d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.updatedItemIds)||[];
       var errMsg=d.errors?d.errors[0].message:null;
       var ids=pairs.map(function(p){return p.id;});
-      var debug='lid='+ctx.lid+' slug='+(ctx.slug||slug)+' ids='+JSON.stringify(ids.slice(0,2))+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,250);
+      var debug='lid='+ctx.lid+' slug='+(ctx.slug||preferredSlug)+' searchURL='+(ctx.searchURL||'none').substring(0,60)+' ids='+JSON.stringify(ids.slice(0,2))+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,200);
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:!!c,count:c?c.itemCount:0,added:updatedIds.length,err:errMsg,debug:debug}));
     }).catch(function(e){
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:String(e),debug:'catch:'+String(e)}));
@@ -173,55 +174,43 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[], p
     var results=new Array(items.length).fill(null);
     var pending=items.length;
     if(pending===0){finalize(results);return;}
-    // Launch all searches in parallel
     items.forEach(function(item,i){
-      searchForV4Id(item.name,item.productUrl,i===0,function(v4id){
+      searchForV4Id(item.name,i===0,function(v4id){
         results[i]=v4id;
-        pending--;
-        if(pending===0)finalize(results);
+        if(--pending===0)finalize(results);
       });
     });
   }
 
   function finalize(results){
     var slug=ctx.slug||preferredSlug||'';
-    // If lid was never captured by the intercept, extract it from the first found v4ItemId
     if(!ctx.lid){
-      for(var k=0;k<results.length;k++){
-        if(results[k]){var lmf=results[k].match(/^items_([^-]+)/);if(lmf){ctx.lid=lmf[1];break;}}
-      }
+      for(var k=0;k<results.length;k++){if(results[k]){var lmf=results[k].match(/^items_([^-]+)/);if(lmf){ctx.lid=lmf[1];break;}}}
     }
+    var diag='lid='+ctx.lid+' slug='+slug+' fetchCount='+(ctx.fetchCount||0)+' searchURL='+(ctx.searchURL||'none').substring(0,80)+' fetchUrls='+(ctx.fetchUrls||[]).join('|').substring(0,150);
     if(!ctx.lid){
-      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:'lid=null slug='+slug+' no_location_found'}));
+      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:diag}));
       return;
     }
     var pairs=items.map(function(it,j){
       if(results[j])return{id:results[j],qty:it.qty};
-      var pid=getProductId(it.productUrl);
-      return pid?{id:'items_'+ctx.lid+'-'+pid,qty:it.qty}:null;
+      var m=it.productUrl.match(/\\/products\\/(\\d+)/);
+      return m?{id:'items_'+ctx.lid+'-'+m[1],qty:it.qty}:null;
     }).filter(Boolean);
     if(!pairs.length){
-      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_pairs_found',debug:'lid='+ctx.lid+' slug='+slug}));
+      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_pairs_found',debug:diag}));
       return;
     }
-    addToCart(pairs,slug);
+    addToCart(pairs);
   }
 
   var n=0;
   function poll(){
-    if(!ctx.lid&&Object.keys(ctx.v4ids).length>0){
-      var first=Object.values(ctx.v4ids)[0];
-      var lm=first.match(/^items_([^-]+)/);if(lm)ctx.lid=lm[1];
-    }
-    try{
-      var nd=window.__NEXT_DATA__||{};
-      if(!ctx.lid){var ndStr=JSON.stringify(nd);var m2=ndStr.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];}
-    }catch(e){}
-    if(ctx.lid){resolveAndAdd();return;}
-    n++;
-    // Only wait up to 3 seconds for the intercept to capture lid — if it doesn't,
-    // proceed anyway and let searchForV4Id extract lid from the HTML v4ItemIds
-    if(n<6){setTimeout(poll,500);return;}
+    if(!ctx.lid&&Object.keys(ctx.v4ids).length>0){var fv=Object.values(ctx.v4ids)[0];var lm=fv.match(/^items_([^-]+)/);if(lm)ctx.lid=lm[1];}
+    try{var nd=window.__NEXT_DATA__||{};if(!ctx.lid){var ndStr=JSON.stringify(nd);var m2=ndStr.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];}}catch(e){}
+    // Once lid is set OR we've waited 5s for the page to make its API calls, proceed
+    if(ctx.lid||(ctx.searchURL&&Object.keys(ctx.v4ids).length>0)){resolveAndAdd();return;}
+    n++;if(n<10){setTimeout(poll,500);return;}
     resolveAndAdd();
   }
   poll();
@@ -401,11 +390,12 @@ export default function CartScreen() {
     }
 
     const firstItemName = items[0]?.name ?? ''
-    const storeUrl = storeSlug
-      ? `https://www.instacart.ca/store/${storeSlug}/search_v3?k=${encodeURIComponent(firstItemName)}`
-      : firstItemName
-        ? `https://www.instacart.ca/store/s?k=${encodeURIComponent(firstItemName)}`
-        : 'https://www.instacart.ca'
+    // Use the generic search URL — the generic /store/s page makes API calls that
+    // expose retailerLocationId so the intercept can capture lid. The store-specific
+    // URL (/store/walmart/search_v3) doesn't expose lid via client-side API calls.
+    const storeUrl = firstItemName
+      ? `https://www.instacart.ca/store/s?k=${encodeURIComponent(firstItemName)}`
+      : 'https://www.instacart.ca'
 
     pendingItemsRef.current = items
     pendingSlugRef.current = storeSlug
