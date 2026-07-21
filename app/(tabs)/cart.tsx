@@ -16,12 +16,17 @@ import type { Cart, CartItem } from '../../lib/types'
 // retailerLocationId before we inject the mutation.
 // ---------------------------------------------------------------------------
 const INSTACART_INTERCEPT_JS = `
-window.__ctx={cid:null,lid:null,lidSaved:false};
+window.__ctx={cid:null,lid:null,lidSaved:false,v4ids:{}};
 (function(){
   function scan(s){
-    if(!window.__ctx.cid){var m=s.match(/"cartId":"([^"]+)"/);if(m)window.__ctx.cid=m[1];}
     if(!window.__ctx.lid){var m2=s.match(/"retailerLocationId":"([^"]+)"/);if(m2)window.__ctx.lid=m2[1];}
-    if(!window.__ctx.lid){var m3=s.match(/"v4ItemId":"items_([^-"]+)-/);if(m3)window.__ctx.lid=m3[1];}
+    // Capture every v4ItemId seen in API responses, keyed by productId
+    var re=/"v4ItemId":"(items_([^-"]+)-([^"]+))"/g;var mx;
+    while((mx=re.exec(s))!==null){window.__ctx.v4ids[mx[3]]=mx[1];}
+    if(!window.__ctx.lid&&Object.keys(window.__ctx.v4ids).length>0){
+      var first=Object.values(window.__ctx.v4ids)[0];
+      var lm=first.match(/^items_([^-]+)/);if(lm)window.__ctx.lid=lm[1];
+    }
     if(window.__ctx.lid&&!window.__ctx.lidSaved){
       window.__ctx.lidSaved=true;
       window.ReactNativeWebView.postMessage(JSON.stringify({type:'lid',lid:window.__ctx.lid}));
@@ -50,28 +55,24 @@ true;
 
 // ---------------------------------------------------------------------------
 // Build the JS that fires the UpdateCartItemsMutation for all items at once.
+// itemId strategy (in order):
+//   1. ctx.v4ids[productId]  — captured from Instacart's own page-load API calls
+//   2. "items_" + ctx.lid + "-" + productId  — constructed from lid + URL productId
+// No HTML fetches — those hang because Instacart returns JS-rendered pages.
 // ---------------------------------------------------------------------------
 function makeAddJS(items: { productUrl: string; qty: number }[]): string {
   return `(function(items){
   var ctx=window.__ctx;var f=window.__f||window.fetch;
 
-  // Fetch each product page from this authenticated WebView and extract v4ItemId.
-  // This gives us the correct itemId for the user's actual store location,
-  // regardless of where the agent ran.
-  function fetchItemId(url,cb){
-    var path=url.replace(/^https?:\/\/[^/]+/,'');
-    f(path,{credentials:'include',headers:{Accept:'text/html'}})
-      .then(function(r){return r.text();})
-      .then(function(html){
-        var m=html.match(/"v4ItemId":"(items_[^"]+)"/);
-        cb(m?m[1]:null);
-      }).catch(function(){cb(null);});
+  function getProductId(url){
+    var m=url.match(/\\/products\\/(\\d+)/);
+    return m?m[1]:null;
   }
 
-  function addToCart(itemIds){
-    var updates=itemIds.map(function(id,i){return{
-      itemId:id,
-      quantity:items[i].qty,quantityType:'each',
+  function addToCart(pairs){
+    var updates=pairs.map(function(p){return{
+      itemId:p.id,
+      quantity:p.qty,quantityType:'each',
       trackingParams:{attributionMetadata:{shopId:'',nestedShopId:''},trackingProperties:{}}
     };});
     f('/graphql?operationName=UpdateCartItemsMutation',{
@@ -87,47 +88,45 @@ function makeAddJS(items: { productUrl: string; qty: number }[]): string {
       var c=d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.cart;
       var updatedIds=(d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.updatedItemIds)||[];
       var errMsg=d.errors?d.errors[0].message:null;
-      var debug='lid='+ctx.lid+' ids='+JSON.stringify(itemIds)+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,150);
+      var ids=pairs.map(function(p){return p.id;});
+      var debug='lid='+ctx.lid+' v4keys='+JSON.stringify(Object.keys(ctx.v4ids).slice(0,4))+' ids='+JSON.stringify(ids.slice(0,2))+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,200);
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:!!c,count:c?c.itemCount:0,added:updatedIds.length,err:errMsg,debug:debug}));
     }).catch(function(e){
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:String(e),debug:'catch:'+String(e)}));
     });
   }
 
-  function resolveAll(){
-    var resolved=new Array(items.length).fill(null);
-    var pending=items.length;
-    items.forEach(function(item,i){
-      fetchItemId(item.productUrl,function(id){
-        resolved[i]=id;
-        pending--;
-        if(pending===0){
-          var valid=resolved.filter(Boolean);
-          if(!valid.length){
-            window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_items_resolved',debug:'lid='+ctx.lid+' urls='+JSON.stringify(items.map(function(x){return x.productUrl;}))}));
-            return;
-          }
-          // Only add items we successfully resolved
-          var validItems=items.filter(function(_,i){return !!resolved[i];});
-          addToCart(resolved.filter(Boolean));
-        }
-      });
+  function resolveAndAdd(){
+    var pairs=[];
+    items.forEach(function(item){
+      var pid=getProductId(item.productUrl);
+      if(!pid) return;
+      var id=ctx.v4ids[pid]||('items_'+ctx.lid+'-'+pid);
+      pairs.push({id:id,qty:item.qty});
     });
+    if(!pairs.length){
+      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_product_ids',debug:'lid='+ctx.lid+' urls='+JSON.stringify(items.map(function(x){return x.productUrl;}))}));
+      return;
+    }
+    addToCart(pairs);
   }
 
   var n=0;
   function poll(){
+    if(!ctx.lid&&Object.keys(ctx.v4ids).length>0){
+      var first=Object.values(ctx.v4ids)[0];
+      var lm=first.match(/^items_([^-]+)/);if(lm)ctx.lid=lm[1];
+    }
     if(!ctx.lid){
       try{
         var nd=JSON.stringify(window.__NEXT_DATA__||{});
-        if(!ctx.lid){var m2=nd.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];}
-        if(!ctx.lid){var m3=nd.match(/"v4ItemId":"items_([^-"]+)-/);if(m3)ctx.lid=m3[1];}
+        var m2=nd.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];
       }catch(e){}
     }
-    if(ctx.lid){resolveAll();return;}
+    if(ctx.lid){resolveAndAdd();return;}
     n++;
     if(n<60)setTimeout(poll,500);
-    else window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:'url='+window.location.href}));
+    else window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:'url='+window.location.href+' v4keys='+JSON.stringify(Object.keys(ctx.v4ids))}));
   }
   poll();
 })(${JSON.stringify(items)});
