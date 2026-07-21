@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, TouchableOpacity, FlatList,
-  StyleSheet, SafeAreaView, Image, Alert, Modal, ActivityIndicator, Linking, RefreshControl, Animated, ScrollView
+  StyleSheet, SafeAreaView, Image, Modal, ActivityIndicator, Linking, RefreshControl, Animated
 } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
 import { WebView } from 'react-native-webview'
@@ -10,10 +10,92 @@ import { supabase } from '../../lib/supabase'
 import { colors, spacing, radius, font } from '../../lib/theme'
 import type { Cart, CartItem } from '../../lib/types'
 
+// ---------------------------------------------------------------------------
+// Intercept fetch calls made by Instacart's own page to capture cartId and
+// retailerLocationId before we inject the mutation.
+// ---------------------------------------------------------------------------
+const INSTACART_INTERCEPT_JS = `
+window.__ctx={cid:null,lid:null};
+(function(){
+  var o=window.fetch;window.__f=o;
+  window.fetch=function(){
+    return o.apply(this,arguments).then(function(r){
+      r.clone().json().then(function(j){
+        var s=JSON.stringify(j);
+        if(!window.__ctx.cid){var m=s.match(/"cartId":"(\\d+)"/);if(m)window.__ctx.cid=m[1];}
+        if(!window.__ctx.lid){var m2=s.match(/"retailerLocationId":"(\\d+)"/);if(m2)window.__ctx.lid=m2[1];}
+        if(!window.__ctx.lid){var m3=s.match(/"v4ItemId":"items_(\\d+)-/);if(m3)window.__ctx.lid=m3[1];}
+      }).catch(function(){});
+      return r;
+    });
+  };
+})();
+true;
+`
+
+// ---------------------------------------------------------------------------
+// Build the JS that fires the UpdateCartItemsMutation for all items at once.
+// ---------------------------------------------------------------------------
+function makeAddJS(items: { productId: string; qty: number }[]): string {
+  return `(function(items){
+  var ctx=window.__ctx;var f=window.__f||window.fetch;
+  function go(){
+    f('/graphql?operationName=UpdateCartItemsMutation',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-client-identifier':'web'},
+      credentials:'include',
+      body:JSON.stringify({
+        operationName:'UpdateCartItemsMutation',
+        variables:{
+          cartId:ctx.cid,
+          cartItemUpdates:items.map(function(i){return{
+            itemId:'items_'+ctx.lid+'-'+i.productId,
+            quantity:i.qty,quantityType:'each',
+            trackingParams:{attributionMetadata:{shopId:'',nestedShopId:''},trackingProperties:{}}
+          };}),
+          cartType:'grocery',requestTimestamp:Date.now()
+        },
+        extensions:{persistedQuery:{version:1,sha256Hash:'ba4bf465d294d1d528d82a4ac48ac13980d528149874c0e52082dc1d833bdb09'}}
+      })
+    }).then(function(r){return r.json();}).then(function(d){
+      var c=d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.cart;
+      var updatedIds=(d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.updatedItemIds)||[];
+      window.ReactNativeWebView.postMessage(JSON.stringify({ok:!!c,count:c?c.itemCount:0,added:updatedIds.length,err:d.errors?d.errors[0].message:null}));
+    }).catch(function(e){
+      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:String(e)}));
+    });
+  }
+  var n=0;
+  function poll(){
+    if(!ctx.cid||!ctx.lid){
+      try{
+        var nd=JSON.stringify(window.__NEXT_DATA__||{});
+        if(!ctx.cid){var m=nd.match(/"cartId":"(\\d+)"/);if(m)ctx.cid=m[1];}
+        if(!ctx.lid){var m2=nd.match(/"retailerLocationId":"(\\d+)"/);if(m2)ctx.lid=m2[1];}
+        if(!ctx.lid){var m3=nd.match(/"v4ItemId":"items_(\\d+)-/);if(m3)ctx.lid=m3[1];}
+      }catch(e){}
+    }
+    if(ctx.cid&&ctx.lid){go();return;}
+    n++;
+    if(n<24)setTimeout(poll,500);
+    else window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired'}));
+  }
+  poll();
+})(${JSON.stringify(items)});
+true;`
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function extractProductId(url: string): string | null {
+  const m = url.match(/\/products\/(\d+)/)
+  return m ? m[1] : null
+}
+
 function parseQty(quantity?: string): number {
   if (!quantity) return 1
   const trimmed = quantity.trim()
-  // Only use >1 for plain integers — quantities like "500g", "2 cups", "1 lb" mean 1 unit of the product
   if (/^\d+$/.test(trimmed)) {
     const n = parseInt(trimmed, 10)
     return Math.max(1, Math.min(n, 20))
@@ -21,112 +103,23 @@ function parseQty(quantity?: string): number {
   return 1
 }
 
-function makeInjectJS(qty: number): string {
-  return `(function() {
-  var clicked = false;
-  var ogImg = '';
-  var metaOg = document.querySelector('meta[property="og:image"]');
-  if (metaOg) ogImg = metaOg.getAttribute('content') || '';
-
-  function tryClick(el) {
-    try {
-      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-      el.click();
-      return true;
-    } catch(e) { return false; }
-  }
-
-  // 1. data-testid selectors
-  var testIds = [
-    '[data-testid="add-item-to-cart-button"]',
-    '[data-testid*="add_to_cart"]',
-    '[data-testid*="add-to-cart"]',
-    '[data-testid="add-button"]',
-    '[data-testid="AddButton"]',
-  ];
-  for (var i = 0; i < testIds.length; i++) {
-    var el = document.querySelector(testIds[i]);
-    if (el) { tryClick(el); clicked = true; break; }
-  }
-
-  // 2. Exact text / aria-label match
-  if (!clicked) {
-    var phrases = ['add to cart', 'add item', 'add to bag'];
-    var btns = Array.from(document.querySelectorAll('button, [role="button"]'));
-    for (var j = 0; j < btns.length; j++) {
-      var b = btns[j];
-      var txt = (b.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-      var aria = (b.getAttribute('aria-label') || '').toLowerCase();
-      for (var k = 0; k < phrases.length; k++) {
-        if (txt === phrases[k] || aria === phrases[k] || aria.includes('add to cart')) {
-          tryClick(b); clicked = true; break;
-        }
-      }
-      if (clicked) break;
-    }
-  }
-
-  // 3. Loose fallback — button text starts with "Add" and is short
-  if (!clicked) {
-    var allBtns = Array.from(document.querySelectorAll('button'));
-    for (var m = 0; m < allBtns.length; m++) {
-      var t = (allBtns[m].textContent || '').trim().toLowerCase();
-      if (t.startsWith('add') && t.length <= 15 && !t.includes('wishlist') && !t.includes('note') && !t.includes('list')) {
-        tryClick(allBtns[m]); clicked = true; break;
-      }
-    }
-  }
-
-  // Quantity increment
-  var targetQty = ${qty};
-  if (clicked && targetQty > 1) {
-    var done = 0;
-    var needed = targetQty - 1;
-    function inc() {
-      if (done >= needed) return;
-      var incEl = document.querySelector(
-        '[aria-label*="increase" i],[aria-label*="increment" i],[data-testid*="increment"],[aria-label*="add more" i]'
-      );
-      if (!incEl) {
-        var bs = Array.from(document.querySelectorAll('button'));
-        for (var n = 0; n < bs.length; n++) {
-          if ((bs[n].textContent || '').trim() === '+') { incEl = bs[n]; break; }
-        }
-      }
-      if (incEl) { tryClick(incEl); done++; }
-      if (done < needed) setTimeout(inc, 600);
-    }
-    setTimeout(inc, 1500);
-  }
-
-  setTimeout(function() {
-    window.ReactNativeWebView.postMessage(JSON.stringify({
-      clicked: clicked, image: ogImg, url: window.location.href,
-    }));
-  }, clicked ? 2000 : 400);
-})();
-true;`
-}
-
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
 export default function CartScreen() {
   const [cart, setCart] = useState<Cart | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [aiSummary, setAISummary] = useState<string | null>(null)
-  const [showAddFlow, setShowAddFlow] = useState(false)
-  const [addQueue, setAddQueue] = useState<CartItem[]>([])
-  const [addIndex, setAddIndex] = useState(0)
-  const [addStatus, setAddStatus] = useState<'idle' | 'adding' | 'done'>('idle')
-  const [addedCount, setAddedCount] = useState(0)
-  const [isPageLoading, setIsPageLoading] = useState(false)
-  const [needsManual, setNeedsManual] = useState(false)
-  const [completedItemIds, setCompletedItemIds] = useState<string[]>([])
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
 
-  const webViewRef = useRef<WebViewType>(null)
-  const addedRef = useRef(0)
-  const indexRef = useRef(0)
-  const queueRef = useRef<CartItem[]>([])
-  const currentUrlRef = useRef('')
+  // Instacart GraphQL flow state
+  const [instacartPhase, setInstacartPhase] = useState<'idle' | 'loading' | 'adding' | 'done' | 'error'>('idle')
+  const [instacartCount, setInstacartCount] = useState(0)
+  const [showInstacartFlow, setShowInstacartFlow] = useState(false)
+
+  const instacartWebViewRef = useRef<WebViewType>(null)
+  const pendingItemsRef = useRef<{ productId: string; qty: number }[]>([])
   const toastAnim = useRef(new Animated.Value(-80)).current
 
   useEffect(() => {
@@ -181,6 +174,7 @@ export default function CartScreen() {
     setRefreshing(false)
 
     if (newCart?.items?.length) {
+      setSelectedIds(new Set(newCart.items.map((i: CartItem) => i.id)))
       fetchAISummary(newCart.items)
     }
   }
@@ -220,109 +214,75 @@ export default function CartScreen() {
     setCart(null)
   }
 
-  function startAddToInstacart() {
-    if (!cart || cart.items.length === 0) return
-    const instacartItems = cart.items.filter(i => !!i.product_url)
-    if (instacartItems.length === 0) {
-      Alert.alert('No items', 'No product links found in this cart.')
-      return
-    }
-    addedRef.current = 0
-    indexRef.current = 0
-    queueRef.current = instacartItems
-    setAddedCount(0)
-    setAddQueue(instacartItems)
-    setAddIndex(0)
-    setNeedsManual(false)
-    setCompletedItemIds([])
-    setIsPageLoading(true)
-    setAddStatus('adding')
-    setShowAddFlow(true)
+  function toggleItem(id: string) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
   }
 
-  function advanceToNext() {
-    const nextIndex = indexRef.current + 1
-    indexRef.current = nextIndex
-    if (nextIndex < queueRef.current.length) {
-      setAddIndex(nextIndex)
-      setNeedsManual(false)
-      setIsPageLoading(true)
+  function toggleAll() {
+    if (!cart) return
+    if (selectedIds.size === cart.items.length) {
+      setSelectedIds(new Set())
     } else {
-      setAddStatus('done')
+      setSelectedIds(new Set(cart.items.map(i => i.id)))
     }
   }
 
-  function handleNavStateChange(navState: { url: string }) {
-    currentUrlRef.current = navState.url || ''
+  // ---------------------------------------------------------------------------
+  // Instacart GraphQL flow
+  // ---------------------------------------------------------------------------
+  function startInstacartAdd(cartItems: CartItem[]) {
+    const items = cartItems
+      .filter(i => !!i.product_url && !i.product_name?.startsWith('Search for "'))
+      .map(i => {
+        const productId = extractProductId(i.product_url)
+        if (!productId) console.warn('[SGA] No productId from URL:', i.product_url)
+        return productId ? { productId, qty: parseQty(i.quantity) } : null
+      })
+      .filter((i): i is { productId: string; qty: number } => i !== null)
+
+    console.log(`[SGA] startInstacartAdd: ${items.length} of ${cartItems.length} items have valid productIds`)
+
+    if (items.length === 0) return
+
+    pendingItemsRef.current = items
+    setInstacartPhase('loading')
+    setInstacartCount(0)
+    setShowInstacartFlow(true)
   }
 
-  function handleWebViewLoad() {
-    const url = currentUrlRef.current
-    // After adding, Instacart navigates the SPA to the cart page — don't inject there
-    if (url && !url.includes('/products/')) return
-    const item = queueRef.current[indexRef.current]
-    const qty = parseQty(item?.quantity)
-    setTimeout(() => {
-      webViewRef.current?.injectJavaScript(makeInjectJS(qty))
-      setIsPageLoading(false)
-    }, 8000)
+  function handleInstacartLoad() {
+    setInstacartPhase('adding')
+    instacartWebViewRef.current?.injectJavaScript(makeAddJS(pendingItemsRef.current))
   }
 
-  async function handleWebViewMessage(event: { nativeEvent: { data: string } }) {
+  async function handleInstacartMessage(event: { nativeEvent: { data: string } }) {
     try {
-      const data = JSON.parse(event.nativeEvent.data)
-      // Ignore messages from non-product pages (cart, home, etc.)
-      if (data.url && !data.url.includes('/products/')) return
+      const data = JSON.parse(event.nativeEvent.data) as { ok: boolean; count?: number; added?: number; err?: string | null }
+      console.log('[SGA] Instacart API result:', JSON.stringify(data))
 
-      const currentItem = queueRef.current[indexRef.current]
-      if (data.image && currentItem) {
-        supabase.from('cart_items')
-          .update({ image_url: data.image })
-          .eq('id', currentItem.id)
-          .then(() => {
-            setCart(prev => {
-              if (!prev) return prev
-              return {
-                ...prev,
-                items: prev.items.map(i =>
-                  i.id === currentItem.id ? { ...i, image_url: data.image } : i
-                )
-              }
-            })
-          })
-      }
-
-      if (data.clicked) {
-        addedRef.current += 1
-        setAddedCount(addedRef.current)
-        if (currentItem) {
-          setCompletedItemIds(prev => [...prev, currentItem.id])
+      if (data.ok) {
+        setInstacartCount(data.added ?? data.count ?? pendingItemsRef.current.length)
+        setInstacartPhase('done')
+        if (cart) {
+          await supabase.from('carts').update({ status: 'checked_out', instacart_added: true }).eq('id', cart.id)
+          setCart(null)
         }
-        setTimeout(advanceToNext, 600)
       } else {
-        setNeedsManual(true)
+        setInstacartPhase('error')
       }
-    } catch { /* ignore */ }
+    } catch {
+      setInstacartPhase('error')
+    }
   }
 
-  function handleDone() {
-    setShowAddFlow(false)
-    setAddStatus('idle')
-    setAddIndex(0)
-    setAddQueue([])
-    setNeedsManual(false)
-    setCompletedItemIds([])
-    setIsPageLoading(false)
-    indexRef.current = 0
-    queueRef.current = []
-  }
-
-  function openInstacart() {
-    Linking.openURL('https://www.instacart.ca')
-    markCheckedOut()
-    handleDone()
-  }
-
+  // ---------------------------------------------------------------------------
+  // Render helpers
+  // ---------------------------------------------------------------------------
   const Toast = (
     <Animated.View style={[styles.toast, { transform: [{ translateY: toastAnim }] }]}>
       <Text style={styles.toastText}>🛒 Your cart is ready!</Text>
@@ -350,18 +310,24 @@ export default function CartScreen() {
   )
 
   const total = cart.items.reduce((sum, item) => sum + item.price, 0)
-  const currentItem = addQueue[addIndex]
 
   return (
     <SafeAreaView style={styles.container}>
       {Toast}
       <View style={styles.header}>
-        <View>
+        <View style={{ flex: 1 }}>
           <Text style={styles.title}>Your Cart</Text>
           <Text style={styles.subtitle}>
             {cart.items.length} items · AI picked on {new Date(cart.created_at).toLocaleDateString('en-CA', { month: 'short', day: 'numeric' })}
           </Text>
         </View>
+        {!cart.instacart_added && (
+          <TouchableOpacity onPress={toggleAll} style={styles.selectAllBtn}>
+            <Text style={styles.selectAllText}>
+              {selectedIds.size === cart.items.length ? 'Deselect All' : 'Select All'}
+            </Text>
+          </TouchableOpacity>
+        )}
       </View>
 
       <FlatList
@@ -380,7 +346,16 @@ export default function CartScreen() {
           ) : null
         }
         renderItem={({ item }) => (
-          <View style={styles.cartItem}>
+          <TouchableOpacity
+            activeOpacity={0.85}
+            onPress={() => !cart?.instacart_added && toggleItem(item.id)}
+            style={[styles.cartItem, !cart?.instacart_added && !selectedIds.has(item.id) && styles.cartItemUnselected]}
+          >
+            {!cart?.instacart_added && (
+              <View style={[styles.checkbox, selectedIds.has(item.id) && styles.checkboxChecked]}>
+                {selectedIds.has(item.id) && <Text style={styles.checkboxTick}>✓</Text>}
+              </View>
+            )}
             {item.image_url ? (
               <Image
                 source={{ uri: item.image_url }}
@@ -408,7 +383,7 @@ export default function CartScreen() {
                 <Text style={styles.removeBtnText}>Remove</Text>
               </TouchableOpacity>
             </View>
-          </View>
+          </TouchableOpacity>
         )}
         ListFooterComponent={
           <View style={styles.footer}>
@@ -422,115 +397,89 @@ export default function CartScreen() {
       />
 
       <View style={styles.checkoutBar}>
-        <TouchableOpacity style={styles.checkoutBtn} onPress={startAddToInstacart}>
-          <Text style={styles.checkoutBtnText}>Add to Instacart Cart</Text>
-        </TouchableOpacity>
+        {cart.instacart_added ? (
+          <TouchableOpacity
+            style={styles.checkoutBtn}
+            onPress={() => { Linking.openURL('https://www.instacart.ca'); markCheckedOut() }}
+          >
+            <Text style={styles.checkoutBtnText}>Open Instacart to Checkout →</Text>
+          </TouchableOpacity>
+        ) : (
+          <TouchableOpacity
+            style={[styles.checkoutBtn, selectedIds.size === 0 && styles.checkoutBtnDisabled]}
+            disabled={selectedIds.size === 0}
+            onPress={() => startInstacartAdd(cart.items.filter(i => selectedIds.has(i.id)))}
+          >
+            <Text style={styles.checkoutBtnText}>
+              {selectedIds.size === cart.items.length
+                ? 'Add All to Instacart Cart'
+                : `Add ${selectedIds.size} Item${selectedIds.size === 1 ? '' : 's'} to Instacart`}
+            </Text>
+          </TouchableOpacity>
+        )}
       </View>
 
-      <Modal visible={showAddFlow} animationType="slide" presentationStyle="fullScreen">
+      {/* Background WebView modal — overlay always covers the Instacart page */}
+      <Modal visible={showInstacartFlow} animationType="slide" presentationStyle="fullScreen">
         <SafeAreaView style={styles.modalContainer}>
+          {/* Background WebView — hidden behind overlay */}
+          <WebView
+            ref={instacartWebViewRef}
+            source={{ uri: 'https://www.instacart.ca' }}
+            style={{ flex: 1 }}
+            injectedJavaScriptBeforeContentLoaded={INSTACART_INTERCEPT_JS}
+            onLoad={handleInstacartLoad}
+            onMessage={handleInstacartMessage}
+            javaScriptEnabled
+            domStorageEnabled
+            sharedCookiesEnabled
+            thirdPartyCookiesEnabled
+          />
 
-          {addStatus === 'adding' && currentItem?.product_url ? (
-            <View style={{ flex: 1 }}>
-            {/* WebView always takes full space and runs silently */}
-            <WebView
-              ref={webViewRef}
-              source={{ uri: currentItem.product_url }}
-              style={{ flex: 1 }}
-              onLoad={handleWebViewLoad}
-              onNavigationStateChange={handleNavStateChange}
-              onMessage={handleWebViewMessage}
-              javaScriptEnabled
-              domStorageEnabled
-              sharedCookiesEnabled
-              thirdPartyCookiesEnabled
-              userAgent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-            />
+          {/* Status overlay — always covers the WebView */}
+          <View style={[StyleSheet.absoluteFill, styles.instacartOverlay]}>
+            {(instacartPhase === 'loading' || instacartPhase === 'adding') && (
+              <View style={styles.instacartLoading}>
+                <Text style={styles.instacartEmoji}>🛒</Text>
+                <ActivityIndicator size="large" color={colors.primary} style={{ marginTop: spacing.md }} />
+                <Text style={styles.instacartTitle}>Adding to your Instacart cart</Text>
+                <Text style={styles.instacartSub}>
+                  {instacartPhase === 'loading' ? 'Connecting to Instacart...' : 'Adding your items...'}
+                </Text>
+              </View>
+            )}
 
-            {/* Animation overlay covers WebView while auto-adding */}
-            {!needsManual && (
-              <View style={[StyleSheet.absoluteFill, styles.animScreen]}>
-                <TouchableOpacity onPress={handleDone} style={styles.animClose}>
-                  <Ionicons name="close" size={22} color={colors.textSecondary} />
+            {instacartPhase === 'done' && (
+              <View style={styles.instacartDone}>
+                <Text style={styles.instacartEmoji}>✅</Text>
+                <Text style={styles.instacartTitle}>{instacartCount} items in your Instacart cart</Text>
+                <Text style={styles.instacartSub}>Ready to checkout</Text>
+                <TouchableOpacity
+                  style={styles.openBtn}
+                  onPress={() => {
+                    Linking.openURL('https://www.instacart.ca')
+                    setShowInstacartFlow(false)
+                  }}
+                >
+                  <Text style={styles.openBtnText}>Open Instacart →</Text>
                 </TouchableOpacity>
-
-                <View style={styles.animTop}>
-                  <Text style={styles.animCartEmoji}>🛒</Text>
-                  <Text style={styles.animTitle}>Adding to your cart</Text>
-                  <Text style={styles.animSub}>
-                    {isPageLoading ? 'Loading...' : `${addedCount} of ${addQueue.length} done`}
-                  </Text>
-                </View>
-
-                <View style={styles.animProgressTrack}>
-                  <View style={[styles.animProgressFill, {
-                    width: `${Math.round((addedCount / Math.max(addQueue.length, 1)) * 100)}%`
-                  }]} />
-                </View>
-
-                <View style={styles.animList}>
-                  {addQueue.map((item, idx) => {
-                    const done = completedItemIds.includes(item.id)
-                    const active = idx === addIndex && !done
-                    return (
-                      <View key={item.id} style={styles.animRow}>
-                        <Text style={[styles.animRowIcon, done && styles.animRowIconDone, active && styles.animRowIconActive]}>
-                          {done ? '✓' : active ? '·' : '·'}
-                        </Text>
-                        <Text style={[styles.animRowName, done && styles.animRowNameDone, active && styles.animRowNameActive]}>
-                          {item.grocery_item_name}
-                        </Text>
-                        {active && <ActivityIndicator size="small" color={colors.primary} style={{ marginLeft: 'auto' }} />}
-                      </View>
-                    )
-                  })}
-                </View>
+                <TouchableOpacity style={styles.closeBtn} onPress={() => setShowInstacartFlow(false)}>
+                  <Text style={styles.closeBtnText}>Done</Text>
+                </TouchableOpacity>
               </View>
             )}
 
-            {/* Manual bar — only shown when auto-click failed */}
-            {needsManual && (
-              <View style={styles.manualBar}>
-                <Text style={styles.manualText}>Tap "Add to cart" above, then:</Text>
-                <View style={styles.manualActions}>
-                  <TouchableOpacity style={styles.skipBtn} onPress={advanceToNext}>
-                    <Text style={styles.skipBtnText}>Skip</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={styles.nextBtn} onPress={() => {
-                    const item = queueRef.current[indexRef.current]
-                    if (item) setCompletedItemIds(prev => [...prev, item.id])
-                    addedRef.current += 1
-                    setAddedCount(addedRef.current)
-                    advanceToNext()
-                  }}>
-                    <Text style={styles.nextBtnText}>Added — Next →</Text>
-                  </TouchableOpacity>
-                </View>
+            {instacartPhase === 'error' && (
+              <View style={styles.instacartError}>
+                <Text style={styles.instacartEmoji}>⚠️</Text>
+                <Text style={styles.instacartTitle}>Could not connect to Instacart</Text>
+                <Text style={styles.instacartSub}>Your session may have expired. Reconnect in Profile.</Text>
+                <TouchableOpacity style={styles.openBtn} onPress={() => setShowInstacartFlow(false)}>
+                  <Text style={styles.openBtnText}>Close</Text>
+                </TouchableOpacity>
               </View>
             )}
-            </View>
-          ) : addStatus === 'done' ? (
-            <View style={styles.doneContainer}>
-              <Text style={styles.doneIcon}>
-                {addedCount === addQueue.length ? '✅' : '⚠️'}
-              </Text>
-              <Text style={styles.doneTitle}>
-                {addedCount} of {addQueue.length} items added to Instacart
-              </Text>
-              <Text style={styles.doneSub}>
-                {addedCount > 0
-                  ? 'Open Instacart to review your cart and checkout'
-                  : 'Could not add items automatically — open Instacart to add manually'}
-              </Text>
-              <TouchableOpacity style={styles.openInstacartBtn} onPress={openInstacart}>
-                <Text style={styles.openInstacartBtnText}>Open Instacart →</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.closeDoneBtn} onPress={handleDone}>
-                <Text style={styles.closeDoneBtnText}>Close</Text>
-              </TouchableOpacity>
-            </View>
-          ) : null}
-
+          </View>
         </SafeAreaView>
       </Modal>
     </SafeAreaView>
@@ -542,6 +491,8 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: spacing.xl },
   loadingText: { color: colors.textSecondary },
   header: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
     paddingHorizontal: spacing.lg,
     paddingTop: spacing.lg,
     paddingBottom: spacing.md,
@@ -638,7 +589,51 @@ const styles = StyleSheet.create({
     paddingVertical: 16,
     alignItems: 'center',
   },
+  checkoutBtnDisabled: {
+    backgroundColor: colors.border,
+  },
   checkoutBtnText: { color: '#fff', fontSize: font.size.md, fontWeight: '700' },
+  selectAllBtn: {
+    paddingHorizontal: spacing.sm,
+    paddingVertical: spacing.xs,
+  },
+  selectAllText: {
+    fontSize: font.size.sm,
+    color: colors.primary,
+    fontWeight: '600',
+  },
+  cartItemUnselected: {
+    opacity: 0.45,
+  },
+  checkbox: {
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: colors.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 2,
+  },
+  checkboxChecked: {
+    backgroundColor: colors.primary,
+    borderColor: colors.primary,
+  },
+  checkboxTick: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '700',
+    lineHeight: 16,
+  },
+  openInstacartBtn: {
+    backgroundColor: colors.primary,
+    borderRadius: radius.md,
+    paddingVertical: 14,
+    paddingHorizontal: spacing.xl,
+    alignItems: 'center',
+    width: '100%',
+  },
+  openInstacartBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
   toast: {
     position: 'absolute',
     top: 0,
@@ -657,129 +652,45 @@ const styles = StyleSheet.create({
     elevation: 8,
   },
   toastText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
+  // Modal
   modalContainer: { flex: 1, backgroundColor: colors.background },
-  animScreen: {
+  instacartOverlay: {
     backgroundColor: colors.background,
-    paddingHorizontal: spacing.lg,
-    paddingTop: spacing.sm,
-  },
-  animClose: {
-    alignSelf: 'flex-end',
-    padding: spacing.sm,
-  },
-  animTop: {
-    alignItems: 'center',
-    paddingTop: spacing.xl,
-    paddingBottom: spacing.lg,
-    gap: spacing.sm,
-  },
-  animCartEmoji: { fontSize: 52 },
-  animTitle: {
-    fontSize: font.size.xl,
-    fontWeight: '800',
-    color: colors.textPrimary,
-    letterSpacing: -0.3,
-  },
-  animSub: {
-    fontSize: font.size.sm,
-    color: colors.textSecondary,
-    fontWeight: '500',
-  },
-  animProgressTrack: {
-    height: 6,
-    backgroundColor: colors.border,
-    borderRadius: 3,
-    marginBottom: spacing.lg,
-    overflow: 'hidden',
-  },
-  animProgressFill: {
-    height: 6,
-    backgroundColor: colors.primary,
-    borderRadius: 3,
-  },
-  animList: {
-    gap: spacing.sm,
-  },
-  animRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.md,
-    paddingVertical: 6,
-  },
-  animRowIcon: {
-    fontSize: 16,
-    width: 20,
-    color: colors.textMuted,
-    fontWeight: '700',
-  },
-  animRowIconDone: { color: colors.primary },
-  animRowIconActive: { color: colors.primary },
-  animRowName: {
-    fontSize: font.size.md,
-    color: colors.textMuted,
-  },
-  animRowNameDone: {
-    color: colors.textSecondary,
-    textDecorationLine: 'line-through',
-  },
-  animRowNameActive: {
-    color: colors.textPrimary,
-    fontWeight: '600',
-  },
-  manualBar: {
-    backgroundColor: colors.card,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-    padding: spacing.md,
-    paddingBottom: spacing.xl,
-    gap: spacing.sm,
-  },
-  manualText: {
-    fontSize: font.size.sm,
-    color: colors.textPrimary,
-    fontWeight: '600',
-    textAlign: 'center',
-  },
-  manualActions: {
-    flexDirection: 'row',
-    gap: spacing.sm,
-  },
-  skipBtn: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: radius.md,
-    borderWidth: 1,
-    borderColor: colors.border,
-    alignItems: 'center',
-  },
-  skipBtnText: {
-    fontSize: font.size.sm,
-    color: colors.textSecondary,
-    fontWeight: '600',
-  },
-  nextBtn: {
-    flex: 2,
-    paddingVertical: 12,
-    borderRadius: radius.md,
-    backgroundColor: colors.primary,
-    alignItems: 'center',
-  },
-  nextBtnText: {
-    fontSize: font.size.sm,
-    color: '#fff',
-    fontWeight: '700',
-  },
-  doneContainer: {
-    flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
     padding: spacing.xl,
-    gap: spacing.md,
   },
-  doneIcon: { fontSize: 52, marginBottom: spacing.sm },
-  doneTitle: { fontSize: font.size.lg, fontWeight: '700', color: colors.textPrimary, textAlign: 'center' },
-  doneSub: { fontSize: font.size.sm, color: colors.textSecondary, textAlign: 'center', lineHeight: 20 },
-  openInstacartBtn: {
+  instacartLoading: {
+    alignItems: 'center',
+    gap: spacing.sm,
+  },
+  instacartDone: {
+    alignItems: 'center',
+    gap: spacing.md,
+    width: '100%',
+  },
+  instacartError: {
+    alignItems: 'center',
+    gap: spacing.md,
+    width: '100%',
+  },
+  instacartEmoji: {
+    fontSize: 52,
+    marginBottom: spacing.sm,
+  },
+  instacartTitle: {
+    fontSize: font.size.lg,
+    fontWeight: '700',
+    color: colors.textPrimary,
+    textAlign: 'center',
+  },
+  instacartSub: {
+    fontSize: font.size.sm,
+    color: colors.textSecondary,
+    textAlign: 'center',
+    lineHeight: 20,
+  },
+  openBtn: {
     marginTop: spacing.md,
     backgroundColor: colors.primary,
     borderRadius: radius.md,
@@ -788,11 +699,11 @@ const styles = StyleSheet.create({
     width: '100%',
     alignItems: 'center',
   },
-  openInstacartBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
-  closeDoneBtn: {
+  openBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
+  closeBtn: {
     paddingVertical: 12,
     alignItems: 'center',
     width: '100%',
   },
-  closeDoneBtnText: { fontSize: font.size.sm, color: colors.textSecondary },
+  closeBtnText: { fontSize: font.size.sm, color: colors.textSecondary },
 })

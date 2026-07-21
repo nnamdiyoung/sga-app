@@ -25,6 +25,7 @@ export type Cart = {
   status: 'pending' | 'reviewed' | 'checked_out'
   total: number
   platform: string
+  instacart_added: boolean
   items: CartItem[]
 }
 
