@@ -3,6 +3,7 @@ import {
   View, Text, TextInput, TouchableOpacity, ScrollView,
   StyleSheet, SafeAreaView, Alert, Modal, ActivityIndicator
 } from 'react-native'
+import { useLocalSearchParams } from 'expo-router'
 import { WebView } from 'react-native-webview'
 import type { WebView as WebViewType } from 'react-native-webview'
 import { supabase } from '../../lib/supabase'
@@ -32,6 +33,7 @@ const CAPTURE_SESSION_JS = `
 `
 
 export default function Profile() {
+  const { connect } = useLocalSearchParams<{ connect?: string }>()
   const [budget, setBudget] = useState('')
   const [dietary, setDietary] = useState<string[]>([])
   const [allergyInput, setAllergyInput] = useState('')
@@ -52,6 +54,10 @@ export default function Profile() {
   useEffect(() => {
     loadProfile()
   }, [])
+
+  useEffect(() => {
+    if (connect === '1') openInstacartConnect()
+  }, [connect])
 
   async function loadProfile() {
     const { data: { user } } = await supabase.auth.getUser()

@@ -23,9 +23,9 @@ window.__ctx={cid:null,lid:null};
     return o.apply(this,arguments).then(function(r){
       r.clone().json().then(function(j){
         var s=JSON.stringify(j);
-        if(!window.__ctx.cid){var m=s.match(/"cartId":"(\\d+)"/);if(m)window.__ctx.cid=m[1];}
-        if(!window.__ctx.lid){var m2=s.match(/"retailerLocationId":"(\\d+)"/);if(m2)window.__ctx.lid=m2[1];}
-        if(!window.__ctx.lid){var m3=s.match(/"v4ItemId":"items_(\\d+)-/);if(m3)window.__ctx.lid=m3[1];}
+        if(!window.__ctx.cid){var m=s.match(/"cartId":"([^"]+)"/);if(m)window.__ctx.cid=m[1];}
+        if(!window.__ctx.lid){var m2=s.match(/"retailerLocationId":"([^"]+)"/);if(m2)window.__ctx.lid=m2[1];}
+        if(!window.__ctx.lid){var m3=s.match(/"v4ItemId":"items_([^-"]+)-/);if(m3)window.__ctx.lid=m3[1];}
       }).catch(function(){});
       return r;
     });
@@ -71,9 +71,9 @@ function makeAddJS(items: { productId: string; qty: number }[]): string {
     if(!ctx.cid||!ctx.lid){
       try{
         var nd=JSON.stringify(window.__NEXT_DATA__||{});
-        if(!ctx.cid){var m=nd.match(/"cartId":"(\\d+)"/);if(m)ctx.cid=m[1];}
-        if(!ctx.lid){var m2=nd.match(/"retailerLocationId":"(\\d+)"/);if(m2)ctx.lid=m2[1];}
-        if(!ctx.lid){var m3=nd.match(/"v4ItemId":"items_(\\d+)-/);if(m3)ctx.lid=m3[1];}
+        if(!ctx.cid){var m=nd.match(/"cartId":"([^"]+)"/);if(m)ctx.cid=m[1];}
+        if(!ctx.lid){var m2=nd.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];}
+        if(!ctx.lid){var m3=nd.match(/"v4ItemId":"items_([^-"]+)-/);if(m3)ctx.lid=m3[1];}
       }catch(e){}
     }
     if(ctx.cid&&ctx.lid){go();return;}
@@ -492,10 +492,10 @@ export default function CartScreen() {
                   style={styles.openBtn}
                   onPress={() => {
                     setShowInstacartFlow(false)
-                    router.push('/(tabs)/profile')
+                    router.push('/(tabs)/profile?connect=1')
                   }}
                 >
-                  <Text style={styles.openBtnText}>Go to Profile →</Text>
+                  <Text style={styles.openBtnText}>Reconnect Instacart →</Text>
                 </TouchableOpacity>
                 <TouchableOpacity style={styles.closeBtn} onPress={() => setShowInstacartFlow(false)}>
                   <Text style={styles.closeBtnText}>Close</Text>
