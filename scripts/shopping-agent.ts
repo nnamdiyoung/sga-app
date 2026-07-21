@@ -20,8 +20,6 @@ interface Profile {
   dietary: string[];
   allergies: string[];
   brands: string;
-  instacart_email: string;
-  instacart_password: string;
   instacart_session: string;
   preferred_store_slug?: string;
 }
@@ -31,14 +29,11 @@ interface GroceryItem {
   quantity: string;
 }
 
-interface ProductResult {
+interface SearchResult {
   name: string;
   price: number;
   image: string;
-  url: string;
-  store: string;
-  itemId?: string;
-  productId?: string;
+  product_url: string;
 }
 
 interface SelectedProduct {
@@ -51,6 +46,8 @@ interface SelectedProduct {
   swapped: boolean;
   quantity: string;
 }
+
+// ─── Schedule ────────────────────────────────────────────────────────────────
 
 function isEasternDST(date: Date): boolean {
   const year = date.getUTCFullYear();
@@ -67,105 +64,30 @@ function getEasternTime(date: Date): { hour: number; day: number } {
   return { hour: et.getUTCHours(), day: et.getUTCDay() };
 }
 
-async function saveScreenshot(page: Page, label: string): Promise<void> {
-  try {
-    if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
-    const file = path.join(SCREENSHOT_DIR, `${label}-${Date.now()}.png`);
-    await page.screenshot({ path: file, fullPage: false });
-    console.log(`Screenshot saved: ${file}`);
-  } catch { /* non-fatal */ }
-}
-
 async function getUsersToShopFor(): Promise<string[]> {
   const forceRun = process.env.FORCE_RUN === "true";
   const { hour, day } = getEasternTime(new Date());
-  console.log(`Current ET time: day=${day}, hour=${hour}${forceRun ? " (FORCE_RUN — skipping schedule check)" : ""}`);
+  console.log(`ET: day=${day}, hour=${hour}${forceRun ? " (FORCE)" : ""}`);
 
-  const { data, error } = await supabase
-    .from("schedules")
-    .select("user_id, days, time")
-    .eq("active", true);
-
+  const { data, error } = await supabase.from("schedules").select("user_id, days, time").eq("active", true);
   if (error || !data) return [];
 
   return data
     .filter((s) => {
       if (forceRun) return true;
       const schedHour = parseInt(s.time.split(":")[0]);
-      const match = s.days.includes(day) && schedHour === hour;
-      console.log(`Schedule check user ${s.user_id}: days=${JSON.stringify(s.days)} time=${s.time} → ${match ? "MATCH" : "skip"}`);
-      return match;
+      return s.days.includes(day) && schedHour === hour;
     })
     .map((s) => s.user_id);
 }
 
-async function loginInstacart(page: Page, email: string, password: string): Promise<boolean> {
-  if (!email || !password) {
-    console.log("No Instacart credentials, skipping login.");
-    return false;
-  }
+// ─── Browser helpers ──────────────────────────────────────────────────────────
 
+async function saveScreenshot(page: Page, label: string): Promise<void> {
   try {
-    console.log("Navigating to Instacart login...");
-    await page.goto("https://www.instacart.ca/login", { waitUntil: "networkidle", timeout: 30000 });
-    await page.waitForTimeout(2000);
-    await saveScreenshot(page, "instacart-login-page");
-    console.log(`Login page URL: ${page.url()}, title: ${await page.title()}`);
-
-    // Dismiss any cookie / overlay banners first
-    for (const sel of ['button:has-text("Accept")', 'button:has-text("Got it")', 'button:has-text("Close")', '[aria-label="Close"]']) {
-      try { await page.locator(sel).first().click({ timeout: 2000 }); } catch { /* none present */ }
-    }
-
-    // Wait for email field with broad selector list
-    const emailSelectors = [
-      'input[type="email"]',
-      'input[name="email"]',
-      'input[autocomplete="email"]',
-      'input[placeholder*="email" i]',
-      'input[data-testid*="email" i]',
-      'input[id*="email" i]',
-    ];
-
-    let filled = false;
-    for (const sel of emailSelectors) {
-      try {
-        await page.locator(sel).first().fill(email, { timeout: 5000 });
-        console.log(`Filled email with selector: ${sel}`);
-        filled = true;
-        break;
-      } catch { /* try next */ }
-    }
-
-    if (!filled) {
-      await saveScreenshot(page, "instacart-login-no-email-field");
-      console.log("Could not find email field. HTML:", (await page.content()).substring(0, 500));
-      return false;
-    }
-
-    // Password
-    await page.locator('input[type="password"]').first().fill(password, { timeout: 5000 });
-    console.log("Filled password.");
-    await saveScreenshot(page, "instacart-before-submit");
-
-    // Submit
-    for (const sel of ['button[type="submit"]', 'button:has-text("Log in")', 'button:has-text("Sign in")']) {
-      try { await page.locator(sel).first().click({ timeout: 3000 }); break; } catch { /* try next */ }
-    }
-
-    await page.waitForTimeout(5000);
-    await saveScreenshot(page, "instacart-after-submit");
-
-    const currentUrl = page.url();
-    console.log(`After login URL: ${currentUrl}`);
-    const loggedIn = !currentUrl.includes("/login");
-    console.log(loggedIn ? "Instacart login successful." : "Login may have failed — continuing anyway.");
-    return loggedIn;
-  } catch (err) {
-    console.log(`Instacart login error: ${err}`);
-    await saveScreenshot(page, "instacart-login-error");
-    return false;
-  }
+    if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+    await page.screenshot({ path: path.join(SCREENSHOT_DIR, `${label}-${Date.now()}.png`), fullPage: false });
+  } catch { /* non-fatal */ }
 }
 
 function slugToStoreName(slug: string): string {
@@ -177,291 +99,304 @@ function slugToStoreName(slug: string): string {
     .join(" ");
 }
 
+// ─── Instacart search (intercepts API responses) ───────────────────────────
+
 async function searchInstacart(
   page: Page,
-  item: string,
-  lockedStoreSlug?: string
-): Promise<{ results: ProductResult[]; storeSlug: string; storeName: string }> {
-  const results: ProductResult[] = [];
-  const fileSlug = item.replace(/\s/g, "_").substring(0, 20);
+  query: string,
+  storeSlug?: string
+): Promise<{ results: SearchResult[]; detectedStoreSlug: string }> {
+  const results: SearchResult[] = [];
 
   function extractPrice(p: any): number {
-    const raw =
-      p.price ??
-      p.unit_price ??
-      p.pricing?.price ??
-      p.pricing?.unit_price ??
-      p.pricing?.display_price ??
-      p.attributes?.price ??
-      p.displayPrice ??
-      p.display_price ??
-      0;
-    if (!raw) return 0;
+    const raw = p.price ?? p.unit_price ?? p.pricing?.price ?? p.pricing?.unit_price ??
+      p.pricing?.display_price ?? p.attributes?.price ?? p.displayPrice ?? p.display_price ?? 0;
     const n = parseFloat(String(raw).replace(/[^0-9.]/g, ""));
     return isNaN(n) ? 0 : n;
   }
 
-  const responseHandler = async (response: any) => {
+  const handler = async (response: any) => {
     const url: string = response.url();
     if (!url.includes("instacart")) return;
-    const ct = response.headers()["content-type"] ?? "";
-    if (!ct.includes("application/json")) return;
+    if (!(response.headers()["content-type"] ?? "").includes("application/json")) return;
     try {
       const json = await response.json();
       const candidates: any[] =
-        json?.items ??
-        json?.results ??
-        json?.products ??
-        json?.data?.items ??
-        json?.data?.products ??
-        json?.data?.search?.products ??
-        json?.modules?.flatMap((m: any) => m.items ?? m.products ?? []) ??
-        [];
-      if (candidates.length > 0) {
-        const first = candidates[0];
-        const name = first?.name ?? first?.display_name ?? first?.displayName ?? first?.title;
-        console.log(`API ${url.split("?")[0]} — ${candidates.length} candidates, first: name="${name}" keys=${Object.keys(first).slice(0, 8).join(",")}`);
-        for (const p of candidates) {
-          const pname = p.name ?? p.display_name ?? p.displayName ?? p.title;
-          const price = extractPrice(p);
-          const image = p.image_url ?? p.image ?? p.photo ?? p.imageUrl ?? "";
-          const productUrl = p.url ?? p.product_url ?? p.productUrl ?? "";
-          const itemId: string = p.id ?? p.item_id ?? p.itemId ?? "";
-          const productId: string = String(p.productId ?? p.legacyId ?? p.legacy_id ?? "");
-          if (pname && results.length < 5) {
-            results.push({ name: pname, price, image, url: productUrl, store: "Instacart", itemId, productId });
-          }
-        }
+        json?.items ?? json?.results ?? json?.products ??
+        json?.data?.items ?? json?.data?.products ?? json?.data?.search?.products ??
+        json?.modules?.flatMap((m: any) => m.items ?? m.products ?? []) ?? [];
+
+      for (const p of candidates) {
+        if (results.length >= 8) break;
+        const name = p.name ?? p.display_name ?? p.displayName ?? p.title;
+        if (!name) continue;
+        const itemId: string = String(p.id ?? p.item_id ?? p.itemId ?? "");
+        const productId: string = String(p.productId ?? p.legacyId ?? p.legacy_id ?? "");
+        const numericId = productId || itemId.match(/(\d+)$/)?.[1] || "";
+        let product_url = p.url ?? p.product_url ?? "";
+        if (storeSlug && numericId) product_url = `https://www.instacart.ca/store/${storeSlug}/product_page/${numericId}`;
+        else if (numericId) product_url = `https://www.instacart.ca/products/${numericId}`;
+
+        results.push({
+          name,
+          price: extractPrice(p),
+          image: p.image_url ?? p.image ?? p.photo ?? p.imageUrl ?? "",
+          product_url,
+        });
       }
-    } catch { /* non-JSON or parse error */ }
+    } catch { /* skip */ }
   };
 
-  page.on("response", responseHandler);
+  page.on("response", handler);
 
-  let resolvedSlug = lockedStoreSlug ?? "";
-  let resolvedName = resolvedSlug ? slugToStoreName(resolvedSlug) : "Instacart";
+  const searchUrl = storeSlug
+    ? `https://www.instacart.ca/store/${storeSlug}/storefront/s?k=${encodeURIComponent(query)}`
+    : `https://www.instacart.ca/store/s?k=${encodeURIComponent(query)}`;
 
+  let detectedStoreSlug = storeSlug ?? "";
   try {
-    // Use store-specific search URL if we already know the store
-    const searchUrl = lockedStoreSlug
-      ? `https://www.instacart.ca/store/${lockedStoreSlug}/storefront/s?k=${encodeURIComponent(item)}`
-      : `https://www.instacart.ca/store/s?k=${encodeURIComponent(item)}`;
-    console.log(`Searching Instacart for "${item}"${lockedStoreSlug ? ` (store: ${lockedStoreSlug})` : ""}`);
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForTimeout(8000);
-    await saveScreenshot(page, `instacart-search-${fileSlug}`);
-
-    // Capture store slug from the redirected URL on first search
-    if (!lockedStoreSlug) {
-      const finalUrl = page.url();
-      const match = finalUrl.match(/\/store\/([^/?#]+)/);
-      if (match && match[1] !== "s") {
-        resolvedSlug = match[1];
-        resolvedName = slugToStoreName(resolvedSlug);
-        console.log(`Store detected: ${resolvedName} (${resolvedSlug})`);
-      }
+    await page.waitForTimeout(7000);
+    if (!storeSlug) {
+      const match = page.url().match(/\/store\/([^/?#]+)/);
+      if (match && match[1] !== "s") detectedStoreSlug = match[1];
     }
-    console.log(`Instacart search URL: ${page.url()}`);
+    await saveScreenshot(page, `search-${query.replace(/\s/g, "_").substring(0, 15)}`);
   } catch (err) {
-    console.log(`Instacart navigation error for "${item}": ${err}`);
+    console.log(`Search navigation error: ${err}`);
   }
 
-  page.off("response", responseHandler);
-  console.log(`Instacart found ${results.length} results for "${item}"`);
-  return { results, storeSlug: resolvedSlug, storeName: resolvedName };
+  page.off("response", handler);
+  console.log(`Search "${query}"${storeSlug ? ` @ ${storeSlug}` : ""} → ${results.length} results`);
+  return { results, detectedStoreSlug };
 }
 
-async function searchOpenFoodFacts(item: string): Promise<ProductResult[]> {
-  // Reliable fallback — no bot detection, works from any IP including GitHub Actions
-  try {
-    const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encodeURIComponent(item)}&search_simple=1&action=process&json=1&page_size=8&cc=ca`;
-    console.log(`Searching Open Food Facts for "${item}"`);
-    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    const json: any = await res.json();
-    const products: ProductResult[] = [];
-    for (const p of (json.products ?? []).slice(0, 5)) {
-      const name = p.product_name_en ?? p.product_name ?? p.abbreviated_product_name;
-      if (!name?.trim()) continue;
-      const brand = p.brands ? ` (${p.brands.split(",")[0].trim()})` : "";
-      products.push({
-        name: `${name.trim()}${brand}`,
-        price: 0,
-        image: p.image_small_url ?? p.image_url ?? "",
-        url: `https://www.instacart.ca/store/s?k=${encodeURIComponent(name.trim())}`,
-        store: "Instacart",
-      });
-    }
-    console.log(`Open Food Facts found ${products.length} results for "${item}"`);
-    return products;
-  } catch (err) {
-    console.log(`Open Food Facts error for "${item}": ${err}`);
-    return [];
-  }
-}
+// ─── Agentic item shopper ──────────────────────────────────────────────────
 
-async function addToInstacartCart(page: Page, product: ProductResult, quantity: string): Promise<{ added: boolean; price: number; image: string }> {
-  // Parse quantity — take the first integer found, default to 1
-  const qty = Math.max(1, parseInt(quantity.match(/\d+/)?.[0] ?? "1", 10) || 1);
-  try {
-    // Build direct product page URL using productId or numeric suffix of itemId
-    let productPageUrl = "";
-    if (product.productId) {
-      productPageUrl = `https://www.instacart.ca/products/${product.productId}`;
-    } else if (product.itemId) {
-      const match = product.itemId.match(/(\d+)$/);
-      if (match) productPageUrl = `https://www.instacart.ca/products/${match[1]}`;
-    } else if (product.url && product.url.startsWith("http") && !product.url.includes("/store/s?")) {
-      productPageUrl = product.url;
-    }
+const SHOPPING_TOOLS: Anthropic.Tool[] = [
+  {
+    name: "search_instacart",
+    description: "Search Instacart for a product. Returns matching products with names, prices, and URLs. If results are empty, try a shorter or different search term. You can also omit store_slug to let Instacart auto-select the best store.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        query: { type: "string", description: "Product search query" },
+        store_slug: { type: "string", description: "Store slug to search in (optional, leave empty to auto-detect)" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "select_product",
+    description: "Select the best product you found for this grocery item. Call this once you've found a good match.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        product_name: { type: "string" },
+        price: { type: "number", description: "Price in CAD. Estimate a realistic price if 0." },
+        product_url: { type: "string", description: "Product URL from search results" },
+        image_url: { type: "string", description: "Product image URL (can be empty)" },
+        store: { type: "string", description: "Store name (e.g. Walmart, Loblaws)" },
+        reason: { type: "string", description: "Brief reason for your choice" },
+      },
+      required: ["product_name", "price", "product_url", "store", "reason"],
+    },
+  },
+  {
+    name: "mark_not_found",
+    description: "Mark this item as not found after trying multiple searches. Only use after at least 2 search attempts.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        reason: { type: "string" },
+      },
+      required: ["reason"],
+    },
+  },
+];
 
-    if (productPageUrl) {
-      console.log(`Navigating to product page: ${productPageUrl}`);
-      await page.goto(productPageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForTimeout(4000);
-      await saveScreenshot(page, `product-page-${product.name.substring(0, 15).replace(/\s/g, "_")}`);
-    }
+async function shopForItem(
+  page: Page,
+  item: GroceryItem,
+  profile: Profile,
+  lockedStoreSlug: string,
+  lockedStoreName: string
+): Promise<{ product: SelectedProduct | null; storeSlug: string; storeName: string }> {
+  const messages: Anthropic.MessageParam[] = [
+    {
+      role: "user",
+      content: `You are a smart grocery shopping assistant. Find the best product on Instacart for:
 
-    // Scrape real price and product image from the product page
-    let scrapedPrice = product.price;
-    let scrapedImage = product.image;
-    try {
-      const pageData = await page.evaluate(() => {
-        // Price
-        let price: number | null = null;
-        const priceEls = document.querySelectorAll('[class*="price" i],[data-testid*="price" i],[aria-label*="price" i]');
-        for (const el of Array.from(priceEls)) {
-          const text = el.textContent?.trim() ?? "";
-          const m = text.match(/\$\s*(\d+\.?\d*)/);
-          if (m) { price = parseFloat(m[1]); break; }
-        }
-        // Image — look for the main product image
-        let image = "";
-        const imgEls = document.querySelectorAll('img[src*="instacart"],img[src*="cloudfront"],img[src*="cdn"]');
-        for (const el of Array.from(imgEls) as HTMLImageElement[]) {
-          if (el.naturalWidth > 80 && el.src && !el.src.includes("logo")) {
-            image = el.src;
-            break;
-          }
-        }
-        return { price, image };
-      });
-      if (pageData.price && pageData.price > 0) {
-        scrapedPrice = pageData.price;
-        console.log(`Scraped price for "${product.name}": $${scrapedPrice}`);
-      }
-      if (pageData.image) {
-        scrapedImage = pageData.image;
-      }
-    } catch { /* non-fatal */ }
+Item: "${item.name}"
+Quantity needed: ${item.quantity}
+Budget: $${profile.budget ?? "flexible"} CAD total shop
+Dietary: ${profile.dietary?.join(", ") || "none"}
+Allergies: ${profile.allergies?.join(", ") || "none"}
+Preferred brands: ${profile.brands || "no preference"}
+${lockedStoreSlug ? `Store: ${lockedStoreName} (${lockedStoreSlug}) — search here first` : "Store: auto-detect (let Instacart choose)"}
 
-    // Try multiple selector patterns for the "Add to cart" button
-    const addSelectors = [
-      '[data-testid="add-item-to-cart-button"]',
-      '[data-testid*="add-to-cart"]',
-      '[data-testid*="add_to_cart"]',
-      'button[aria-label*="Add to cart" i]',
-      'button[aria-label*="Add" i]:not([aria-label*="address" i])',
-      'button:has-text("Add to cart")',
-      'button:has-text("Add item")',
-      'button:has-text("Add")',
-      '[class*="AddToCart"] button',
-      '[class*="add-to-cart"] button',
-    ];
+Instructions:
+- Use search_instacart to find options
+- If 0 results, try a simpler/shorter search term (e.g. "brioche bread" → "brioche", "paper towel" → "paper towels")
+- If still 0 results without a store slug, try without store_slug to let Instacart auto-select
+- Pick the best value product that matches the item and user preferences
+- Use select_product with the chosen product's URL from the results
+- Only use mark_not_found if you've genuinely exhausted search options`,
+    },
+  ];
 
-    for (const sel of addSelectors) {
-      try {
-        const btn = page.locator(sel).first();
-        if (await btn.isVisible({ timeout: 3000 })) {
-          await btn.click();
-          await page.waitForTimeout(1500);
+  let currentStoreSlug = lockedStoreSlug;
+  let currentStoreName = lockedStoreName;
+  let selectedProduct: SelectedProduct | null = null;
+  let isDone = false;
 
-          // Increase quantity beyond 1 by clicking "+" (qty - 1) more times
-          if (qty > 1) {
-            const incrementSelectors = [
-              '[aria-label*="Increase quantity" i]',
-              '[aria-label*="increment" i]',
-              '[data-testid*="increment"]',
-              'button:has-text("+")',
-            ];
-            for (let q = 1; q < qty; q++) {
-              for (const incSel of incrementSelectors) {
-                try {
-                  const incBtn = page.locator(incSel).first();
-                  if (await incBtn.isVisible({ timeout: 2000 })) {
-                    await incBtn.click();
-                    await page.waitForTimeout(500);
-                    break;
-                  }
-                } catch { continue; }
-              }
-            }
-            console.log(`Set quantity to ${qty} for "${product.name}"`);
-          }
-
-          await saveScreenshot(page, `after-add-${product.name.substring(0, 15).replace(/\s/g, "_")}`);
-          console.log(`Added "${product.name}" (qty ${qty}) to Instacart cart`);
-          return { added: true, price: scrapedPrice, image: scrapedImage };
-        }
-      } catch { continue; }
-    }
-
-    console.log(`Could not find Add button for "${product.name}"`);
-    return { added: false, price: scrapedPrice, image: scrapedImage };
-  } catch (err) {
-    console.log(`addToInstacartCart error for "${product.name}": ${err}`);
-    return { added: false, price: product.price, image: product.image };
-  }
-}
-
-async function pickBestProduct(
-  itemName: string,
-  quantity: string,
-  options: ProductResult[],
-  profile: Profile
-): Promise<number> {
-  if (options.length === 1) return 0;
-
-  const optionsList = options.map((o, i) => `${i}. ${o.name} — $${o.price} CAD (${o.store})`).join("\n");
-
-  try {
+  for (let turn = 0; turn < 6 && !isDone; turn++) {
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
-      max_tokens: 256,
-      system: `You are a grocery shopping assistant. User preferences:
-- Budget: $${profile.budget} CAD per shop
-- Dietary: ${profile.dietary?.join(", ") || "none"}
-- Allergies: ${profile.allergies?.join(", ") || "none"}
-- Preferred brands: ${profile.brands || "none"}
-Pick the best product. If price is 0, estimate a realistic Canadian grocery price.
-Respond ONLY with JSON: { "index": N, "price": <estimated price if 0 else original>, "reason": "one line" }`,
-      messages: [{
-        role: "user",
-        content: `I need: ${itemName} (qty: ${quantity})\n\nOptions:\n${optionsList}\n\nBest pick?`,
-      }],
+      max_tokens: 1024,
+      tools: SHOPPING_TOOLS,
+      messages,
     });
 
-    const text = response.content[0].type === "text" ? response.content[0].text : "";
-    const match = text.match(/\{.*?\}/s);
-    if (match) {
-      const parsed = JSON.parse(match[0]);
-      const idx = Math.min(parsed.index ?? 0, options.length - 1);
-      console.log(`Claude picked index ${idx} for "${itemName}": ${parsed.reason}`);
-      // Use Claude's estimated price if original was 0
-      if (parsed.price && options[idx].price === 0) {
-        options[idx].price = parseFloat(parsed.price);
+    messages.push({ role: "assistant", content: response.content });
+
+    if (response.stop_reason === "end_turn") break;
+
+    const toolResults: Anthropic.ToolResultBlockParam[] = [];
+
+    for (const block of response.content) {
+      if (block.type !== "tool_use") continue;
+
+      if (block.name === "search_instacart") {
+        const input = block.input as { query: string; store_slug?: string };
+        const slug = input.store_slug || currentStoreSlug || undefined;
+        const { results, detectedStoreSlug } = await searchInstacart(page, input.query, slug);
+
+        // Capture store from first successful search
+        if (!currentStoreSlug && detectedStoreSlug) {
+          currentStoreSlug = detectedStoreSlug;
+          currentStoreName = slugToStoreName(detectedStoreSlug);
+          console.log(`Store auto-detected: ${currentStoreName}`);
+        }
+
+        const resultText = results.length > 0
+          ? `Found ${results.length} products at ${currentStoreName || "Instacart"}:\n` +
+            results.map((r, i) => `${i + 1}. ${r.name} — $${r.price} CAD\n   URL: ${r.product_url}\n   Image: ${r.image}`).join("\n")
+          : `No results for "${input.query}" at ${slug ? slugToStoreName(slug) : "auto-detected store"}. Try a different search term or omit store_slug.`;
+
+        toolResults.push({ type: "tool_result", tool_use_id: block.id, content: resultText });
       }
-      return idx;
+
+      else if (block.name === "select_product") {
+        const input = block.input as {
+          product_name: string; price: number; product_url: string;
+          image_url?: string; store: string; reason: string;
+        };
+        console.log(`✓ "${item.name}" → ${input.product_name} @ $${input.price} (${input.store}) — ${input.reason}`);
+        selectedProduct = {
+          grocery_item_name: item.name,
+          product_name: input.product_name,
+          price: input.price,
+          image_url: input.image_url ?? "",
+          product_url: input.product_url,
+          store: input.store,
+          swapped: false,
+          quantity: item.quantity,
+        };
+        if (!currentStoreName) currentStoreName = input.store;
+        isDone = true;
+        toolResults.push({ type: "tool_result", tool_use_id: block.id, content: "Product saved." });
+      }
+
+      else if (block.name === "mark_not_found") {
+        const input = block.input as { reason: string };
+        console.log(`✗ "${item.name}" not found — ${input.reason}`);
+        // Placeholder so the cart still shows something
+        selectedProduct = {
+          grocery_item_name: item.name,
+          product_name: `Search for "${item.name}"`,
+          price: 0,
+          image_url: "",
+          product_url: currentStoreSlug
+            ? `https://www.instacart.ca/store/${currentStoreSlug}/storefront/s?k=${encodeURIComponent(item.name)}`
+            : `https://www.instacart.ca/store/s?k=${encodeURIComponent(item.name)}`,
+          store: currentStoreName || "Instacart",
+          swapped: false,
+          quantity: item.quantity,
+        };
+        isDone = true;
+        toolResults.push({ type: "tool_result", tool_use_id: block.id, content: "Noted." });
+      }
     }
-  } catch (err) {
-    console.log(`Claude pick error: ${err}`);
+
+    if (toolResults.length > 0) {
+      messages.push({ role: "user", content: toolResults });
+    }
   }
 
-  return 0;
+  return { product: selectedProduct, storeSlug: currentStoreSlug, storeName: currentStoreName };
 }
 
+// ─── Session setup ────────────────────────────────────────────────────────────
+
+async function buildBrowserContext(browser: Browser, profile: Profile) {
+  type SessionData = {
+    storageState?: { cookies: any[]; origins: any[] };
+    cookies?: string;
+    localStorage?: Record<string, string>;
+  };
+
+  let sessionData: SessionData = {};
+  if (profile?.instacart_session) {
+    try { sessionData = JSON.parse(profile.instacart_session); } catch { /* skip */ }
+  }
+
+  if (sessionData.storageState) {
+    console.log(`Using full storageState (${sessionData.storageState.cookies.length} cookies incl. HttpOnly)`);
+    return browser.newContext({
+      storageState: sessionData.storageState as any,
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      viewport: { width: 1280, height: 800 },
+      locale: "en-CA",
+    });
+  }
+
+  const context = await browser.newContext({
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    viewport: { width: 1280, height: 800 },
+    locale: "en-CA",
+  });
+
+  if (sessionData.localStorage && Object.keys(sessionData.localStorage).length > 0) {
+    await context.addInitScript((ls) => {
+      for (const [k, v] of Object.entries(ls)) {
+        try { localStorage.setItem(k, v as string); } catch { }
+      }
+    }, sessionData.localStorage);
+    console.log(`Injected ${Object.keys(sessionData.localStorage).length} localStorage entries`);
+  }
+
+  if (sessionData.cookies) {
+    const parsed = sessionData.cookies.split(";")
+      .map((c) => {
+        const eq = c.indexOf("=");
+        if (eq === -1) return null;
+        return { name: c.substring(0, eq).trim(), value: c.substring(eq + 1).trim(), domain: ".instacart.ca", path: "/" };
+      })
+      .filter((c): c is NonNullable<typeof c> => !!c?.name && !!c?.value);
+    if (parsed.length > 0) {
+      await context.addCookies(parsed);
+      console.log(`Injected ${parsed.length} session cookies`);
+    }
+  }
+
+  return context;
+}
+
+// ─── Process one user ─────────────────────────────────────────────────────────
+
 async function processUser(userId: string, browser: Browser): Promise<void> {
-  // Multi-store mode: specific items + existing cart
-  const existingCartId = process.env.CART_ID || "";
+  const existingCartId = process.env.CART_ID ?? "";
   const itemNameFilter = process.env.ITEM_NAMES
     ? process.env.ITEM_NAMES.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
     : [];
@@ -475,245 +410,105 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   let items: GroceryItem[] = itemsRes.data ?? [];
   const profile: Profile = profileRes.data;
 
-  // Filter to specific items for multi-store runs
   if (itemNameFilter.length > 0) {
     items = items.filter((i) => itemNameFilter.includes(i.name.toLowerCase()));
-    console.log(`Multi-store run: searching for [${items.map((i) => i.name).join(", ")}]`);
+    console.log(`Multi-store run: [${items.map((i) => i.name).join(", ")}]`);
   }
 
-  if (!items.length) {
-    console.log(`No items for user ${userId}, skipping.`);
-    return;
-  }
+  if (!items.length) { console.log(`No items for ${userId}`); return; }
 
-  console.log(`Processing ${items.length} items for user ${userId}`);
+  console.log(`\nShopping ${items.length} items for user ${userId}`);
 
   const authRes = await supabase.auth.admin.getUserById(userId);
   const userEmail = authRes.data?.user?.email;
   if (!userEmail) return;
 
-  // Parse Instacart session — supports both full storageState (from script) and legacy WebView capture
-  type SessionData = {
-    storageState?: { cookies: any[]; origins: any[] };
-    cookies?: string;
-    localStorage?: Record<string, string>;
-  };
-  let sessionData: SessionData = {};
-  if (profile?.instacart_session) {
-    try {
-      sessionData = JSON.parse(profile.instacart_session);
-      console.log("Loaded Instacart session from user profile.");
-    } catch {
-      console.log("Could not parse instacart_session from profile.");
-    }
-  } else {
-    console.log("No Instacart session in profile — cart additions will fail.");
-  }
-
-  // If we have a full Playwright storageState, use it directly — it includes HttpOnly cookies
-  const context = sessionData.storageState
-    ? await browser.newContext({
-        storageState: sessionData.storageState as any,
-        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        viewport: { width: 1280, height: 800 },
-        locale: "en-CA",
-      })
-    : await browser.newContext({
-        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        viewport: { width: 1280, height: 800 },
-        locale: "en-CA",
-      });
-
-  if (sessionData.storageState) {
-    console.log(`Using full storageState: ${sessionData.storageState.cookies.length} cookies (incl. HttpOnly).`);
-  } else {
-    // Legacy: inject non-HttpOnly cookies + localStorage from WebView capture
-    if (sessionData.localStorage && Object.keys(sessionData.localStorage).length > 0) {
-      await context.addInitScript((ls) => {
-        for (const [key, value] of Object.entries(ls)) {
-          try { localStorage.setItem(key, value as string); } catch {}
-        }
-      }, sessionData.localStorage);
-      console.log(`Injected ${Object.keys(sessionData.localStorage).length} localStorage entries.`);
-    }
-
-    if (sessionData.cookies) {
-      const parsed = sessionData.cookies.split(';')
-        .map(c => {
-          const eq = c.indexOf('=');
-          if (eq === -1) return null;
-          return {
-            name: c.substring(0, eq).trim(),
-            value: c.substring(eq + 1).trim(),
-            domain: '.instacart.ca',
-            path: '/',
-          };
-        })
-        .filter((c): c is NonNullable<typeof c> => !!c?.name && !!c?.value);
-      if (parsed.length > 0) {
-        await context.addCookies(parsed);
-        console.log(`Injected ${parsed.length} cookies (legacy WebView capture).`);
-      }
-    }
-  }
-
+  const context = await buildBrowserContext(browser, profile);
   const page = await context.newPage();
 
-  const selectedProducts: SelectedProduct[] = [];
-  // Priority: STORE_SLUG env (Shop Now pick) → profile preferred → auto-detect
+  // Determine starting store
   let lockedStoreSlug = process.env.STORE_SLUG || profile?.preferred_store_slug || "";
-  let lockedStoreName = lockedStoreSlug ? slugToStoreName(lockedStoreSlug) : "Instacart";
-  if (lockedStoreSlug) {
-    console.log(`Store locked to: ${lockedStoreName} (${lockedStoreSlug})${process.env.STORE_SLUG ? " [from Shop Now]" : " [from profile]"}`);
-  }
+  let lockedStoreName = lockedStoreSlug ? slugToStoreName(lockedStoreSlug) : "";
+  if (lockedStoreSlug) console.log(`Starting store: ${lockedStoreName} (${lockedStoreSlug})`);
+
+  const selectedProducts: SelectedProduct[] = [];
 
   for (const item of items) {
-    console.log(`\n--- Shopping for: ${item.name} ---`);
+    console.log(`\n── Shopping for: ${item.name} ──`);
+    const { product, storeSlug, storeName } = await shopForItem(page, item, profile, lockedStoreSlug, lockedStoreName);
 
-    let { results: instacartResults, storeSlug, storeName } = await searchInstacart(page, item.name, lockedStoreSlug || undefined);
-
-    // If store-specific URL returned nothing, fall back to generic URL (auto-redirect works better in headless)
-    if (instacartResults.length === 0 && lockedStoreSlug) {
-      console.log(`Store-specific search returned 0, retrying with generic URL...`);
-      ({ results: instacartResults, storeSlug, storeName } = await searchInstacart(page, item.name));
-    }
-
-    // Lock store after first successful Instacart search
+    // Lock store after first item
     if (!lockedStoreSlug && storeSlug) {
       lockedStoreSlug = storeSlug;
       lockedStoreName = storeName;
-      console.log(`Store locked to: ${lockedStoreName} for all remaining items`);
+      console.log(`Store locked: ${lockedStoreName}`);
     }
 
-    let results = instacartResults;
-
-    if (results.length === 0) {
-      console.log(`No Instacart results, trying Open Food Facts...`);
-      results = await searchOpenFoodFacts(item.name);
-    }
-
-    if (results.length === 0) {
-      console.log(`No results found for "${item.name}", adding placeholder.`);
-      const fallbackUrl = lockedStoreSlug
-        ? `https://www.instacart.ca/store/${lockedStoreSlug}/storefront/s?k=${encodeURIComponent(item.name)}`
-        : `https://www.instacart.ca/store/s?k=${encodeURIComponent(item.name)}`;
-      selectedProducts.push({
-        grocery_item_name: item.name,
-        product_name: `Search for "${item.name}"`,
-        price: 0,
-        image_url: "",
-        product_url: fallbackUrl,
-        store: lockedStoreName,
-        swapped: false,
-        quantity: item.quantity,
-      });
-    } else {
-      const idx = await pickBestProduct(item.name, item.quantity, results, profile);
-      const chosen = results[idx];
-      console.log(`Picked: ${chosen.name} @ $${chosen.price} (${lockedStoreName})`);
-
-      // Build store-specific product URL so the app opens the right store context
-      let productUrl = chosen.url;
-      const numericId = chosen.productId || chosen.itemId?.match(/(\d+)$/)?.[1] || "";
-      if (lockedStoreSlug && numericId) {
-        productUrl = `https://www.instacart.ca/store/${lockedStoreSlug}/product_page/${numericId}`;
-      } else if (numericId) {
-        productUrl = `https://www.instacart.ca/products/${numericId}`;
-      } else if (lockedStoreSlug) {
-        // Fallback: store-specific search so WebView lands in the right store
-        productUrl = `https://www.instacart.ca/store/${lockedStoreSlug}/storefront/s?k=${encodeURIComponent(chosen.name)}`;
-      }
-
-      selectedProducts.push({
-        grocery_item_name: item.name,
-        product_name: chosen.name,
-        price: chosen.price,
-        image_url: chosen.image,
-        product_url: productUrl,
-        store: lockedStoreName,
-        swapped: false,
-        quantity: item.quantity,
-      });
-    }
-
-    await new Promise((r) => setTimeout(r, 1500));
+    if (product) selectedProducts.push(product);
+    await new Promise((r) => setTimeout(r, 1000));
   }
 
   await context.close();
 
+  if (selectedProducts.length === 0) {
+    console.log("No products found, skipping cart creation.");
+    return;
+  }
+
   const total = selectedProducts.reduce((sum, p) => sum + (p.price ?? 0), 0);
 
-  let cartId = existingCartId;
-
   if (isMultiStoreRun) {
-    // Add to existing cart
     await supabase.from("cart_items").insert(
-      selectedProducts.map((p) => ({ cart_id: cartId, ...p }))
+      selectedProducts.map((p) => ({ cart_id: existingCartId, ...p }))
     );
-    console.log(`Multi-store: added ${selectedProducts.length} items to existing cart ${cartId}`);
-  } else {
-    // Create new cart
-    const { data: cart, error: cartError } = await supabase
-      .from("carts")
-      .insert({ user_id: userId, status: "pending", total: parseFloat(total.toFixed(2)), platform: "instacart" })
-      .select("id")
-      .single();
-
-    if (cartError || !cart) throw new Error(`Failed to create cart: ${cartError?.message}`);
-    cartId = cart.id;
-
-    await supabase.from("cart_items").insert(
-      selectedProducts.map((p) => ({ cart_id: cartId, ...p }))
-    );
-
-    // Clear all grocery items for a full run
-    await supabase.from("grocery_items").update({ cleared: true }).eq("user_id", userId).eq("cleared", false);
-
-    const unfound = selectedProducts.filter((p) => p.product_name.startsWith('Search for "'));
-    const itemListHtml = selectedProducts
-      .map((p) => `<li><strong>${p.grocery_item_name}</strong> → ${p.product_name} ($${p.price.toFixed(2)} CAD)</li>`)
-      .join("\n");
-    const unfoundNote = unfound.length > 0
-      ? `<p>⚠️ <strong>${unfound.length} item(s) not found</strong> at ${lockedStoreName}: ${unfound.map((p) => p.grocery_item_name).join(", ")}. Open the app to search other stores.</p>`
-      : "";
-
-    await resend.emails.send({
-      from: "onboarding@resend.dev",
-      to: userEmail,
-      subject: `🛒 Your cart is ready — ${selectedProducts.length} items, ~$${total.toFixed(2)} CAD`,
-      html: `
-        <h2>Your SGA cart is ready!</h2>
-        <p><strong>${selectedProducts.length} items</strong>, approximately <strong>$${total.toFixed(2)} CAD</strong>.</p>
-        <ul>${itemListHtml}</ul>
-        ${unfoundNote}
-        <p>Open the SGA app, go to the Cart tab, and tap <strong>Add to Instacart Cart</strong>.</p>
-      `,
-    });
+    console.log(`Multi-store: added ${selectedProducts.length} items to cart ${existingCartId}`);
+    return;
   }
 
-  console.log(`\nDone for user ${userId}: ${selectedProducts.length} items, $${total.toFixed(2)} CAD.`);
+  const { data: cart, error: cartError } = await supabase
+    .from("carts")
+    .insert({ user_id: userId, status: "pending", total: parseFloat(total.toFixed(2)), platform: "instacart" })
+    .select("id")
+    .single();
+
+  if (cartError || !cart) throw new Error(`Cart creation failed: ${cartError?.message}`);
+
+  await supabase.from("cart_items").insert(selectedProducts.map((p) => ({ cart_id: cart.id, ...p })));
+  await supabase.from("grocery_items").update({ cleared: true }).eq("user_id", userId).eq("cleared", false);
+
+  const unfound = selectedProducts.filter((p) => p.product_name.startsWith('Search for "'));
+  const itemListHtml = selectedProducts
+    .map((p) => `<li><b>${p.grocery_item_name}</b> → ${p.product_name} ($${p.price.toFixed(2)} CAD) — ${p.store}</li>`)
+    .join("\n");
+  const unfoundNote = unfound.length > 0
+    ? `<p>⚠️ <b>${unfound.length} item(s) not found</b>: ${unfound.map((p) => p.grocery_item_name).join(", ")}. Open the app to search other stores.</p>`
+    : "";
+
+  await resend.emails.send({
+    from: "onboarding@resend.dev",
+    to: userEmail,
+    subject: `🛒 Cart ready — ${selectedProducts.length} items ~$${total.toFixed(2)} CAD`,
+    html: `<h2>Your SGA cart is ready!</h2><ul>${itemListHtml}</ul>${unfoundNote}<p>Open the SGA app → Cart tab → Add to Instacart Cart.</p>`,
+  });
+
+  console.log(`\nDone: ${selectedProducts.length} items, $${total.toFixed(2)} CAD`);
 }
 
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
 async function main(): Promise<void> {
-  console.log("SGA Shopping Agent starting...");
-
+  console.log("SGA Agent starting...");
   const userIds = await getUsersToShopFor();
-  console.log(`Found ${userIds.length} user(s) to shop for.`);
-
-  if (userIds.length === 0) return;
+  console.log(`Users to shop for: ${userIds.length}`);
+  if (!userIds.length) return;
 
   const browser = await chromium.launch({ headless: true });
-
   for (const userId of userIds) {
-    try {
-      await processUser(userId, browser);
-    } catch (err) {
-      console.error(`Error for user ${userId}:`, err);
-    }
+    try { await processUser(userId, browser); }
+    catch (err) { console.error(`Error for ${userId}:`, err); }
   }
-
   await browser.close();
-  console.log("SGA Shopping Agent done.");
+  console.log("SGA Agent done.");
 }
 
 main();
