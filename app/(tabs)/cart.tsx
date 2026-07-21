@@ -185,6 +185,16 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[], p
 
   function finalize(results){
     var slug=ctx.slug||preferredSlug||'';
+    // If lid was never captured by the intercept, extract it from the first found v4ItemId
+    if(!ctx.lid){
+      for(var k=0;k<results.length;k++){
+        if(results[k]){var lmf=results[k].match(/^items_([^-]+)/);if(lmf){ctx.lid=lmf[1];break;}}
+      }
+    }
+    if(!ctx.lid){
+      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:'lid=null slug='+slug+' no_location_found'}));
+      return;
+    }
     var pairs=items.map(function(it,j){
       if(results[j])return{id:results[j],qty:it.qty};
       var pid=getProductId(it.productUrl);
@@ -209,10 +219,10 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[], p
     }catch(e){}
     if(ctx.lid){resolveAndAdd();return;}
     n++;
-    if(n<60){setTimeout(poll,500);return;}
-    var dbg='lid='+ctx.lid+' slug='+(ctx.slug||preferredSlug)+' url='+window.location.href;
-    if(ctx.lid){resolveAndAdd();}
-    else{window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:dbg}));}
+    // Only wait up to 3 seconds for the intercept to capture lid — if it doesn't,
+    // proceed anyway and let searchForV4Id extract lid from the HTML v4ItemIds
+    if(n<6){setTimeout(poll,500);return;}
+    resolveAndAdd();
   }
   poll();
 })(${JSON.stringify(items)},${JSON.stringify(preferredSlug)});
