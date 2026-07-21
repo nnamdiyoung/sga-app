@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, TextInput, TouchableOpacity, FlatList,
   StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform,
-  Alert, Animated, RefreshControl
+  Alert, Animated, RefreshControl, Modal, ActivityIndicator
 } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
 import { supabase } from '../../lib/supabase'
@@ -17,7 +17,15 @@ export default function GroceryList() {
   const [quantity, setQuantity] = useState('')
   const [loading, setLoading] = useState(true)
   const [nextShop, setNextShop] = useState<string | null>(null)
+
+  // AI expand state
+  const [showAIModal, setShowAIModal] = useState(false)
+  const [aiText, setAIText] = useState('')
+  const [aiLoading, setAILoading] = useState(false)
+  const [aiResult, setAIResult] = useState<string | null>(null)
+
   const inputRef = useRef<TextInput>(null)
+  const aiInputRef = useRef<TextInput>(null)
 
   useEffect(() => {
     let channel: ReturnType<typeof supabase.channel> | null = null
@@ -29,7 +37,6 @@ export default function GroceryList() {
 
       await fetchItems()
 
-      // Auto-clear list when agent marks items as cleared
       channel = supabase
         .channel('grocery-items-cleared')
         .on('postgres_changes', {
@@ -37,9 +44,7 @@ export default function GroceryList() {
           schema: 'public',
           table: 'grocery_items',
         }, (payload) => {
-          if (payload.new.user_id === user.id) {
-            fetchItems()
-          }
+          if (payload.new.user_id === user.id) fetchItems()
         })
         .subscribe()
     }
@@ -59,10 +64,6 @@ export default function GroceryList() {
       .order('added_at', { ascending: false })
     setItems(data ?? [])
     setLoading(false)
-  }
-
-  async function handleRefresh() {
-    await fetchItems()
   }
 
   async function fetchNextShop() {
@@ -129,6 +130,47 @@ export default function GroceryList() {
     ])
   }
 
+  function openAIModal() {
+    setAIText('')
+    setAIResult(null)
+    setShowAIModal(true)
+    setTimeout(() => aiInputRef.current?.focus(), 300)
+  }
+
+  async function runAIExpand() {
+    if (!aiText.trim() || aiLoading) return
+    setAILoading(true)
+    setAIResult(null)
+
+    const { data, error } = await supabase.functions.invoke('expand-grocery-list', {
+      body: { text: aiText.trim() },
+    })
+
+    if (error || !data?.items?.length) {
+      setAILoading(false)
+      setAIResult("Couldn't expand that — try being more specific (e.g. 'pasta carbonara for 2').")
+      return
+    }
+
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) { setAILoading(false); return }
+
+    const rows = (data.items as { name: string; quantity: string }[]).map(i => ({
+      user_id: user.id,
+      name: i.name,
+      quantity: i.quantity || '1',
+      notes: '',
+      cleared: false,
+    }))
+
+    const { data: inserted } = await supabase.from('grocery_items').insert(rows).select()
+    if (inserted) setItems(prev => [...inserted, ...prev])
+
+    setAILoading(false)
+    setAIResult(`Added ${inserted?.length ?? rows.length} item${rows.length !== 1 ? 's' : ''} to your list`)
+    setTimeout(() => setShowAIModal(false), 1200)
+  }
+
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
@@ -141,11 +183,16 @@ export default function GroceryList() {
             </View>
           )}
         </View>
-        {items.length > 0 && (
-          <TouchableOpacity onPress={clearAll} style={styles.clearBtn}>
-            <Text style={styles.clearBtnText}>Clear all</Text>
+        <View style={styles.headerActions}>
+          {items.length > 0 && (
+            <TouchableOpacity onPress={clearAll} style={styles.clearBtn}>
+              <Text style={styles.clearBtnText}>Clear all</Text>
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity onPress={openAIModal} style={styles.aiBtn}>
+            <Ionicons name="sparkles" size={16} color={colors.primary} />
           </TouchableOpacity>
-        )}
+        </View>
       </View>
 
       <View style={styles.statsRow}>
@@ -153,10 +200,10 @@ export default function GroceryList() {
           <Text style={styles.statNumber}>{items.length}</Text>
           <Text style={styles.statLabel}>Items</Text>
         </View>
-        <View style={[styles.statCard, { backgroundColor: colors.primaryLight }]}>
+        <TouchableOpacity style={[styles.statCard, { backgroundColor: colors.primaryLight }]} onPress={openAIModal} activeOpacity={0.75}>
           <Ionicons name="sparkles" size={18} color={colors.primary} />
-          <Text style={[styles.statLabel, { color: colors.primary }]}>AI Ready</Text>
-        </View>
+          <Text style={[styles.statLabel, { color: colors.primary }]}>Ask SGA</Text>
+        </TouchableOpacity>
       </View>
 
       <KeyboardAvoidingView
@@ -169,7 +216,7 @@ export default function GroceryList() {
           keyExtractor={item => item.id}
           contentContainerStyle={styles.list}
           showsVerticalScrollIndicator={false}
-          refreshControl={<RefreshControl refreshing={false} onRefresh={handleRefresh} tintColor={colors.primary} />}
+          refreshControl={<RefreshControl refreshing={false} onRefresh={fetchItems} tintColor={colors.primary} />}
           ListEmptyComponent={
             !loading ? (
               <View style={styles.empty}>
@@ -178,13 +225,15 @@ export default function GroceryList() {
                 </View>
                 <Text style={styles.emptyTitle}>Your list is empty</Text>
                 <Text style={styles.emptyText}>
-                  Add items below. SGA will find the best matches and build your cart automatically.
+                  Add items below, or tap{' '}
+                  <Text style={{ color: colors.primary, fontWeight: '700' }}>Ask SGA</Text>
+                  {' '}to describe what you need.
                 </Text>
               </View>
             ) : null
           }
           renderItem={({ item, index }) => (
-            <View style={[styles.item, { opacity: 1 }]}>
+            <View style={styles.item}>
               <View style={styles.itemLeft}>
                 <View style={styles.itemIndex}>
                   <Text style={styles.itemIndexText}>{index + 1}</Text>
@@ -228,6 +277,67 @@ export default function GroceryList() {
           </View>
         </View>
       </KeyboardAvoidingView>
+
+      {/* AI Expand Modal */}
+      <Modal visible={showAIModal} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setShowAIModal(false)}>
+        <SafeAreaView style={styles.aiModal}>
+          <View style={styles.aiModalHeader}>
+            <View style={styles.aiModalTitleRow}>
+              <Ionicons name="sparkles" size={20} color={colors.primary} />
+              <Text style={styles.aiModalTitle}>Ask SGA</Text>
+            </View>
+            <TouchableOpacity onPress={() => setShowAIModal(false)} style={styles.aiModalClose}>
+              <Ionicons name="close" size={22} color={colors.textSecondary} />
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.aiModalBody}>
+            <Text style={styles.aiModalHint}>
+              Describe what you need and SGA will build your list.
+            </Text>
+            <Text style={styles.aiModalExamples}>
+              "Pasta carbonara for 4"  ·  "Healthy meal prep for the week"  ·  "Breakfast items"
+            </Text>
+
+            <TextInput
+              ref={aiInputRef}
+              style={styles.aiTextInput}
+              value={aiText}
+              onChangeText={setAIText}
+              placeholder="What do you need?"
+              placeholderTextColor={colors.textMuted}
+              multiline
+              returnKeyType="send"
+              onSubmitEditing={runAIExpand}
+              blurOnSubmit
+            />
+
+            {aiResult && (
+              <Text style={[
+                styles.aiResultText,
+                aiResult.startsWith("Couldn't") ? { color: colors.danger } : { color: colors.primary }
+              ]}>
+                {aiResult}
+              </Text>
+            )}
+
+            <TouchableOpacity
+              style={[styles.aiSendBtn, (!aiText.trim() || aiLoading) && { opacity: 0.5 }]}
+              onPress={runAIExpand}
+              disabled={!aiText.trim() || aiLoading}
+            >
+              {aiLoading ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <>
+                  <Ionicons name="sparkles" size={16} color="#fff" />
+                  <Text style={styles.aiSendBtnText}>Generate List</Text>
+                </>
+              )}
+            </TouchableOpacity>
+          </View>
+        </SafeAreaView>
+      </Modal>
     </SafeAreaView>
   )
 }
@@ -259,6 +369,12 @@ const styles = StyleSheet.create({
     color: colors.primary,
     fontWeight: '600',
   },
+  headerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    marginTop: 4,
+  },
   clearBtn: {
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.xs,
@@ -266,6 +382,14 @@ const styles = StyleSheet.create({
     backgroundColor: colors.dangerLight,
   },
   clearBtnText: { fontSize: font.size.sm, color: colors.danger, fontWeight: '600' },
+  aiBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: colors.primaryLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   statsRow: {
     flexDirection: 'row',
     gap: spacing.sm,
@@ -393,4 +517,59 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     ...shadow.sm,
   },
+  // AI Modal
+  aiModal: { flex: 1, backgroundColor: colors.background },
+  aiModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+  },
+  aiModalTitleRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  aiModalTitle: { fontSize: font.size.lg, fontWeight: '700', color: colors.textPrimary },
+  aiModalClose: { padding: spacing.xs },
+  aiModalBody: { padding: spacing.lg, gap: spacing.md },
+  aiModalHint: {
+    fontSize: font.size.md,
+    color: colors.textPrimary,
+    fontWeight: '600',
+  },
+  aiModalExamples: {
+    fontSize: font.size.sm,
+    color: colors.textMuted,
+    lineHeight: 20,
+  },
+  aiTextInput: {
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.md,
+    fontSize: font.size.md,
+    color: colors.textPrimary,
+    minHeight: 100,
+    textAlignVertical: 'top',
+    marginTop: spacing.sm,
+  },
+  aiResultText: {
+    fontSize: font.size.sm,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  aiSendBtn: {
+    backgroundColor: colors.primary,
+    borderRadius: radius.md,
+    paddingVertical: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexDirection: 'row',
+    gap: spacing.sm,
+    marginTop: spacing.sm,
+    ...shadow.sm,
+  },
+  aiSendBtnText: { color: '#fff', fontSize: font.size.md, fontWeight: '700' },
 })

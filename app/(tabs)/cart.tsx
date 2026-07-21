@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, TouchableOpacity, FlatList,
-  StyleSheet, SafeAreaView, Image, Alert, Modal, ActivityIndicator, Linking, RefreshControl, Animated
+  StyleSheet, SafeAreaView, Image, Alert, Modal, ActivityIndicator, Linking, RefreshControl, Animated, ScrollView
 } from 'react-native'
+import { Ionicons } from '@expo/vector-icons'
 import { WebView } from 'react-native-webview'
 import type { WebView as WebViewType } from 'react-native-webview'
 import { supabase } from '../../lib/supabase'
@@ -83,6 +84,7 @@ export default function CartScreen() {
   const [cart, setCart] = useState<Cart | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [aiSummary, setAISummary] = useState<string | null>(null)
   const [showAddFlow, setShowAddFlow] = useState(false)
   const [addQueue, setAddQueue] = useState<CartItem[]>([])
   const [addIndex, setAddIndex] = useState(0)
@@ -145,13 +147,27 @@ export default function CartScreen() {
       .order('created_at', { ascending: false })
       .limit(1)
       .single()
-    setCart(cartData ?? null)
+    const newCart = cartData ?? null
+    setCart(newCart)
     setLoading(false)
     setRefreshing(false)
+
+    if (newCart?.items?.length) {
+      fetchAISummary(newCart.items)
+    }
+  }
+
+  async function fetchAISummary(items: CartItem[]) {
+    setAISummary(null)
+    const { data } = await supabase.functions.invoke('explain-cart', {
+      body: { cart_items: items },
+    })
+    if (data?.summary) setAISummary(data.summary)
   }
 
   async function handleRefresh() {
     setRefreshing(true)
+    setAISummary(null)
     await fetchLatestCart(true)
   }
 
@@ -328,6 +344,14 @@ export default function CartScreen() {
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} tintColor={colors.primary} />
         }
+        ListHeaderComponent={
+          aiSummary ? (
+            <View style={styles.aiSummaryCard}>
+              <Ionicons name="sparkles" size={14} color={colors.primary} />
+              <Text style={styles.aiSummaryText}>{aiSummary}</Text>
+            </View>
+          ) : null
+        }
         renderItem={({ item }) => (
           <View style={styles.cartItem}>
             {item.image_url ? (
@@ -493,7 +517,23 @@ const styles = StyleSheet.create({
   emptyIcon: { fontSize: 48, marginBottom: spacing.md },
   emptyTitle: { fontSize: font.size.lg, fontWeight: '700', color: colors.textPrimary, marginBottom: spacing.sm },
   emptyText: { fontSize: font.size.sm, color: colors.textSecondary, textAlign: 'center', lineHeight: 20 },
-  list: { paddingHorizontal: spacing.lg, paddingBottom: 120 },
+  list: { paddingHorizontal: spacing.lg, paddingBottom: 120, gap: spacing.sm },
+  aiSummaryCard: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: spacing.sm,
+    backgroundColor: colors.primaryLight,
+    borderRadius: radius.md,
+    padding: spacing.md,
+    marginBottom: spacing.sm,
+  },
+  aiSummaryText: {
+    flex: 1,
+    fontSize: font.size.sm,
+    color: colors.primary,
+    fontWeight: '600',
+    lineHeight: 20,
+  },
   cartItem: {
     flexDirection: 'row',
     backgroundColor: colors.card,
