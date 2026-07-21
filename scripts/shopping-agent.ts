@@ -214,8 +214,12 @@ async function shopForGroceries(
   page: Page,
   items: GroceryItem[],
   profile: Profile,
+  preferredStore?: string,
 ): Promise<SelectedProduct[]> {
   const itemList = items.map(i => `- ${i.name} (qty: ${i.quantity})`).join("\n");
+  const storeHint = preferredStore
+    ? `\nStore preference: The user wants to shop at ${preferredStore}. Search there first. Only look elsewhere if something is genuinely unavailable.`
+    : "";
 
   const messages: Anthropic.MessageParam[] = [
     {
@@ -228,13 +232,15 @@ User preferences:
 - Budget: $${profile.budget ?? "flexible"} CAD
 - Dietary: ${profile.dietary?.join(", ") || "none"}
 - Allergies: ${profile.allergies?.join(", ") || "none"}
-- Preferred brands: ${profile.brands || "no strong preference"}
+- Preferred brands: ${profile.brands || "no strong preference"}${storeHint}
 
 Be smart about this:
 - Try to get everything from one store — it's better for the user (one checkout)
 - But don't skip an item just to stay in one store; finding the item matters more
+- Respect dietary restrictions and allergies strictly — never pick something that violates them
+- If budget is set, prefer value options and flag if total is likely over budget
 - If a search returns nothing, try a shorter or different term before giving up
-- Pick good value products that match the user's preferences and dietary needs
+- Pick good value products that match the user's preferences
 - Once you have everything (or have genuinely tried), call finalize_cart with all your selections
 
 Search however makes sense to you. Use your judgment.`,
@@ -314,6 +320,79 @@ Search however makes sense to you. Use your judgment.`,
   }
 
   return finalSelections;
+}
+
+// ─── Instacart cart addition ──────────────────────────────────────────────────
+
+async function addToInstacartCart(page: Page, product: SelectedProduct): Promise<boolean> {
+  if (!product.product_url || product.product_name.startsWith('Search for "')) return false;
+
+  try {
+    await page.goto(product.product_url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForTimeout(4000);
+    await saveScreenshot(page, `pre-add-${product.grocery_item_name.replace(/[^a-z0-9]/gi, "_").substring(0, 20)}`);
+
+    // Redirect to login means session expired
+    if (page.url().includes("/login") || page.url().includes("/sign_in")) {
+      console.log("Instacart session expired — cannot add to cart");
+      return false;
+    }
+
+    const selectors = [
+      '[data-testid="add-button"]',
+      '[data-testid="AddButton"]',
+      'button[aria-label*="Add to cart"]',
+      'button:has-text("Add to cart")',
+      'button:has-text("Add")',
+    ];
+
+    for (const sel of selectors) {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await btn.click();
+        await page.waitForTimeout(2000);
+        return true;
+      }
+    }
+
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+// ─── Email summary (Claude-written) ──────────────────────────────────────────
+
+async function generateEmailSummary(
+  selectedProducts: SelectedProduct[],
+  total: number,
+  instacartAdded: boolean,
+  addedCount: number,
+): Promise<string> {
+  const found = selectedProducts.filter(p => !p.product_name.startsWith('Search for "'));
+  const notFound = selectedProducts.filter(p => p.product_name.startsWith('Search for "'));
+  const stores = [...new Set(found.map(p => p.store).filter(Boolean))];
+
+  const context = [
+    `Found ${found.length} of ${selectedProducts.length} items.`,
+    stores.length > 0 ? `Store(s): ${stores.join(", ")}.` : "",
+    `Estimated total: ~$${total.toFixed(2)} CAD.`,
+    notFound.length > 0 ? `Not found: ${notFound.map(p => p.grocery_item_name).join(", ")}.` : "",
+    instacartAdded
+      ? `Successfully added ${addedCount} item(s) directly to the user's Instacart cart.`
+      : "Items were not automatically added to Instacart (session may have expired).",
+  ].filter(Boolean).join(" ");
+
+  const msg = await anthropic.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 250,
+    messages: [{
+      role: "user",
+      content: `Write a short, friendly 3-4 sentence email body for a grocery shopping app. Be warm but concise — no bullet lists, no HTML, just sentences. Here's what happened:\n\n${context}\n\n${instacartAdded ? "Tell them their Instacart cart is pre-loaded and they just need to open Instacart and check out." : "Tell them to open the SGA app → Cart tab to review and add items to Instacart."}`,
+    }],
+  });
+
+  return (msg.content[0] as Anthropic.TextBlock).text;
 }
 
 // ─── Session setup ────────────────────────────────────────────────────────────
@@ -406,16 +485,36 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   const page = await context.newPage();
 
   const preferredStore = process.env.STORE_SLUG ? slugToStoreName(process.env.STORE_SLUG) : null;
-  if (preferredStore) console.log(`Store preference: ${preferredStore} (hint only — Claude decides)`);
+  if (preferredStore) console.log(`Store preference: ${preferredStore}`);
 
   console.log(`\nStarting agentic shop for ${items.length} items...`);
-  const selectedProducts = await shopForGroceries(page, items, profile);
-  await context.close();
+  const selectedProducts = await shopForGroceries(page, items, profile, preferredStore ?? undefined);
 
   if (selectedProducts.length === 0) {
+    await context.close();
     console.log("No products found, skipping cart creation.");
     return;
   }
+
+  // Try adding directly to the user's Instacart cart via Playwright
+  let instacartAdded = false;
+  let addedCount = 0;
+  if (profile.instacart_session) {
+    console.log("\nAdding items directly to Instacart cart...");
+    for (const product of selectedProducts) {
+      const success = await addToInstacartCart(page, product);
+      if (success) {
+        addedCount++;
+        console.log(`✓ Instacart cart: ${product.product_name}`);
+      } else {
+        console.log(`✗ Instacart cart skipped: ${product.grocery_item_name}`);
+      }
+    }
+    instacartAdded = addedCount > 0;
+    console.log(`Instacart: ${addedCount}/${selectedProducts.filter(p => !p.product_name.startsWith('Search for "')).length} items added`);
+  }
+
+  await context.close();
 
   const total = selectedProducts.reduce((sum, p) => sum + (p.price ?? 0), 0);
 
@@ -438,22 +537,19 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   await supabase.from("cart_items").insert(selectedProducts.map((p) => ({ cart_id: cart.id, ...p })));
   await supabase.from("grocery_items").update({ cleared: true }).eq("user_id", userId).eq("cleared", false);
 
-  const unfound = selectedProducts.filter((p) => p.product_name.startsWith('Search for "'));
-  const itemListHtml = selectedProducts
-    .map((p) => `<li><b>${p.grocery_item_name}</b> → ${p.product_name} ($${p.price.toFixed(2)} CAD) — ${p.store}</li>`)
-    .join("\n");
-  const unfoundNote = unfound.length > 0
-    ? `<p>⚠️ <b>${unfound.length} item(s) not found</b>: ${unfound.map((p) => p.grocery_item_name).join(", ")}. Open the app to search other stores.</p>`
-    : "";
+  const emailBody = await generateEmailSummary(selectedProducts, total, instacartAdded, addedCount);
+  const subject = instacartAdded
+    ? `✅ ${addedCount} items added to Instacart — ~$${total.toFixed(2)} CAD`
+    : `🛒 Cart ready — ${selectedProducts.length} items ~$${total.toFixed(2)} CAD`;
 
   await resend.emails.send({
     from: "onboarding@resend.dev",
     to: userEmail,
-    subject: `🛒 Cart ready — ${selectedProducts.length} items ~$${total.toFixed(2)} CAD`,
-    html: `<h2>Your SGA cart is ready!</h2><ul>${itemListHtml}</ul>${unfoundNote}<p>Open the SGA app → Cart tab → Add to Instacart Cart.</p>`,
+    subject,
+    html: `<p>${emailBody.replace(/\n/g, "</p><p>")}</p>`,
   });
 
-  console.log(`\nDone: ${selectedProducts.length} items, $${total.toFixed(2)} CAD`);
+  console.log(`\nDone: ${selectedProducts.length} items, $${total.toFixed(2)} CAD, Instacart added: ${instacartAdded}`);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
