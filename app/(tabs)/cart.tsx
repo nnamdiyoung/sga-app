@@ -16,7 +16,7 @@ import type { Cart, CartItem } from '../../lib/types'
 // retailerLocationId before we inject the mutation.
 // ---------------------------------------------------------------------------
 const INSTACART_INTERCEPT_JS = `
-window.__ctx={cid:null,lid:null,slug:null,lidSaved:false,v4ids:{}};
+window.__ctx={cid:null,lid:null,slug:null,lidSaved:false,v4ids:{},searchReq:null,searchOp:'',searchQKey:''};
 (function(){
   function scan(s){
     if(!window.__ctx.lid){var m2=s.match(/"retailerLocationId":"([^"]+)"/);if(m2)window.__ctx.lid=m2[1];}
@@ -34,7 +34,26 @@ window.__ctx={cid:null,lid:null,slug:null,lidSaved:false,v4ids:{}};
     }
   }
   var fo=window.fetch;window.__f=fo;
-  window.fetch=function(){
+  window.fetch=function(input,init){
+    if(!window.__ctx.searchReq&&init&&init.body){
+      try{
+        var b=String(init.body);
+        if(b.includes('persistedQuery')){
+          var rq=JSON.parse(b);
+          if(rq.operationName&&/search|find/i.test(rq.operationName)&&rq.variables&&rq.extensions&&rq.extensions.persistedQuery){
+            var qkeys=['query','searchTerm','q','term','searchQuery','keyword'];
+            for(var qi=0;qi<qkeys.length;qi++){
+              if(typeof rq.variables[qkeys[qi]]==='string'&&rq.variables[qkeys[qi]].length>0){
+                window.__ctx.searchReq=b;
+                window.__ctx.searchOp=rq.operationName;
+                window.__ctx.searchQKey=qkeys[qi];
+                break;
+              }
+            }
+          }
+        }
+      }catch(e){}
+    }
     return fo.apply(this,arguments).then(function(r){
       r.clone().text().then(function(t){try{scan(t);}catch(e){}}).catch(function(){});
       return r;
@@ -70,29 +89,29 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
     var m=url.match(/\\/products\\/(\\d+)/);
     return m?m[1]:null;
   }
-  function getSlug(url){
-    var m=url.match(/\\/store\\/([^/]+)\\//);
-    return m?m[1]:null;
-  }
 
-  // Fetch search page HTML (authenticated WebView session = user's location).
-  // Use store-specific URL if slug known, else storeless /store/s?k= (same as agent uses).
-  // 6-second timeout prevents hanging on slow responses.
-  function searchForId(slug,name,cb){
+  // Replay Instacart's own captured search GraphQL request with a new query term.
+  // This returns products valid at the user's actual store location (ctx.lid).
+  function searchByGraphQL(name,cb){
     var done=false;
-    var timer=setTimeout(function(){if(!done){done=true;cb(null);}},6000);
-    var path=slug
-      ?'/store/'+slug+'/search_v3?q='+encodeURIComponent(name)
-      :'/store/s?k='+encodeURIComponent(name);
-    f(path,{
-      credentials:'include',
-      headers:{Accept:'text/html,*/*','Cache-Control':'no-cache'}
-    }).then(function(r){return r.text();}).then(function(html){
-      if(done)return;done=true;clearTimeout(timer);
-      // Extract first v4ItemId from server-side rendered HTML
-      var m=html.match(/"v4ItemId":"(items_[^"]+)"/);
-      cb(m?m[1]:null);
-    }).catch(function(){if(!done){done=true;clearTimeout(timer);cb(null);}});
+    var timer=setTimeout(function(){if(!done){done=true;cb(null);}},8000);
+    try{
+      var reqObj=JSON.parse(ctx.searchReq);
+      reqObj.variables[ctx.searchQKey]=name;
+      if(reqObj.variables.requestTimestamp!==undefined)reqObj.variables.requestTimestamp=Date.now();
+      var ep='/graphql?operationName='+encodeURIComponent(reqObj.operationName||ctx.searchOp||'Search');
+      f(ep,{
+        method:'POST',
+        headers:{'Content-Type':'application/json','x-client-identifier':'web'},
+        credentials:'include',
+        body:JSON.stringify(reqObj)
+      }).then(function(r){return r.json();}).then(function(d){
+        if(done)return;done=true;clearTimeout(timer);
+        var str=JSON.stringify(d);
+        var m=str.match(/"v4ItemId":"(items_[^"]+)"/);
+        cb(m?m[1]:null);
+      }).catch(function(){if(!done){done=true;clearTimeout(timer);cb(null);}});
+    }catch(e){if(!done){done=true;clearTimeout(timer);cb(null);}}
   }
 
   function addToCart(pairs){
@@ -115,40 +134,46 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
       var updatedIds=(d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.updatedItemIds)||[];
       var errMsg=d.errors?d.errors[0].message:null;
       var ids=pairs.map(function(p){return p.id;});
-      var debug='lid='+ctx.lid+' searchIds='+JSON.stringify(ids.slice(0,2))+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,250);
+      var debug='lid='+ctx.lid+' op='+ctx.searchOp+' qkey='+ctx.searchQKey+' ids='+JSON.stringify(ids.slice(0,2))+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,250);
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:!!c,count:c?c.itemCount:0,added:updatedIds.length,err:errMsg,debug:debug}));
     }).catch(function(e){
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:String(e),debug:'catch:'+String(e)}));
     });
   }
 
-  function resolveAndAdd(slug){  // slug may be null — storeless search is used as fallback
+  function resolveAndAdd(){
     var results=new Array(items.length).fill(null);
     var pending=items.length;
     items.forEach(function(item,i){
-      searchForId(slug,item.name,function(v4id){
-        results[i]=v4id;
+      if(ctx.searchReq){
+        searchByGraphQL(item.name,function(v4id){
+          results[i]=v4id;
+          pending--;
+          if(pending===0) finalize(results);
+        });
+      } else {
+        // No search API captured — skip search, go straight to fallback
         pending--;
-        if(pending===0){
-          var pairs=items.map(function(it,j){
-            if(results[j])return{id:results[j],qty:it.qty};
-            var pid=getProductId(it.productUrl);
-            var fallback=ctx.v4ids[pid]||(pid?('items_'+ctx.lid+'-'+pid):null);
-            return fallback?{id:fallback,qty:it.qty}:null;
-          }).filter(Boolean);
-          if(!pairs.length){
-            window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_product_ids',debug:'lid='+ctx.lid+' slug='+slug}));
-            return;
-          }
-          addToCart(pairs);
-        }
-      });
+        if(pending===0) finalize(results);
+      }
     });
+  }
+
+  function finalize(results){
+    var pairs=items.map(function(it,j){
+      if(results[j])return{id:results[j],qty:it.qty};
+      var pid=getProductId(it.productUrl);
+      return pid?{id:'items_'+ctx.lid+'-'+pid,qty:it.qty}:null;
+    }).filter(Boolean);
+    if(!pairs.length){
+      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_pairs_found',debug:'lid='+ctx.lid+' op='+ctx.searchOp+' hasReq='+(!!ctx.searchReq)}));
+      return;
+    }
+    addToCart(pairs);
   }
 
   var n=0;
   function poll(){
-    // Resolve lid from v4ids or __NEXT_DATA__ if intercept hasn't done it yet
     if(!ctx.lid&&Object.keys(ctx.v4ids).length>0){
       var first=Object.values(ctx.v4ids)[0];
       var lm=first.match(/^items_([^-]+)/);if(lm)ctx.lid=lm[1];
@@ -159,17 +184,13 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
         var m2=nd.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];
       }catch(e){}
     }
-    if(ctx.lid){
-      // Best slug: from intercept → items' productUrls → current URL → null (uses storeless search)
-      var slug=ctx.slug||null;
-      if(!slug){for(var i=0;i<items.length;i++){slug=getSlug(items[i].productUrl);if(slug)break;}}
-      if(!slug){var um=window.location.href.match(/\\/store\\/([^/?#]+)/);if(um&&um[1]!=='s')slug=um[1];}
-      resolveAndAdd(slug);
-      return;
-    }
+    if(ctx.lid&&ctx.searchReq){resolveAndAdd();return;}
     n++;
-    if(n<60)setTimeout(poll,500);
-    else window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:'url='+window.location.href+' lid='+ctx.lid+' slug='+ctx.slug}));
+    if(n<60){setTimeout(poll,500);return;}
+    // 30s timeout — if we have lid but no searchReq, try fallback (will use constructed IDs)
+    var dbg='lid='+ctx.lid+' op='+ctx.searchOp+' hasReq='+(!!ctx.searchReq)+' url='+window.location.href;
+    if(ctx.lid){resolveAndAdd();}
+    else{window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:dbg}));}
   }
   poll();
 })(${JSON.stringify(items)});
@@ -339,10 +360,10 @@ export default function CartScreen() {
 
     if (items.length === 0) return
 
-    // Load a specific product URL — product pages always trigger cart-state API
-    // calls (to show Add vs In Cart), which contain cartId + retailerLocationId
-    const firstProductUrl = cartItems.find(i => i.product_url?.includes('/store/'))?.product_url
-    const storeUrl = firstProductUrl ?? 'https://www.instacart.ca'
+    const firstItemName = items[0]?.name ?? ''
+    const storeUrl = firstItemName
+      ? `https://www.instacart.ca/store/s?k=${encodeURIComponent(firstItemName)}`
+      : 'https://www.instacart.ca'
 
     pendingItemsRef.current = items
     setInstacartUrl(storeUrl)
