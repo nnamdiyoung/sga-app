@@ -90,28 +90,20 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
     return m?m[1]:null;
   }
 
-  // Replay Instacart's own captured search GraphQL request with a new query term.
-  // This returns products valid at the user's actual store location (ctx.lid).
-  function searchByGraphQL(name,cb){
+  // Use Next.js /_next/data route to fetch search results as JSON at the user's location.
+  function searchViaNextData(buildId,name,cb){
     var done=false;
     var timer=setTimeout(function(){if(!done){done=true;cb(null);}},8000);
-    try{
-      var reqObj=JSON.parse(ctx.searchReq);
-      reqObj.variables[ctx.searchQKey]=name;
-      if(reqObj.variables.requestTimestamp!==undefined)reqObj.variables.requestTimestamp=Date.now();
-      var ep='/graphql?operationName='+encodeURIComponent(reqObj.operationName||ctx.searchOp||'Search');
-      f(ep,{
-        method:'POST',
-        headers:{'Content-Type':'application/json','x-client-identifier':'web'},
-        credentials:'include',
-        body:JSON.stringify(reqObj)
-      }).then(function(r){return r.json();}).then(function(d){
+    var url='/_next/data/'+buildId+'/store/s.json?k='+encodeURIComponent(name);
+    f(url,{credentials:'include'})
+      .then(function(r){return r.json();})
+      .then(function(d){
         if(done)return;done=true;clearTimeout(timer);
         var str=JSON.stringify(d);
         var m=str.match(/"v4ItemId":"(items_[^"]+)"/);
         cb(m?m[1]:null);
-      }).catch(function(){if(!done){done=true;clearTimeout(timer);cb(null);}});
-    }catch(e){if(!done){done=true;clearTimeout(timer);cb(null);}}
+      })
+      .catch(function(){if(!done){done=true;clearTimeout(timer);cb(null);}});
   }
 
   function addToCart(pairs){
@@ -134,27 +126,28 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
       var updatedIds=(d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.updatedItemIds)||[];
       var errMsg=d.errors?d.errors[0].message:null;
       var ids=pairs.map(function(p){return p.id;});
-      var debug='lid='+ctx.lid+' op='+ctx.searchOp+' qkey='+ctx.searchQKey+' ids='+JSON.stringify(ids.slice(0,2))+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,250);
+      var debug='lid='+ctx.lid+' buildId='+buildId+' ids='+JSON.stringify(ids.slice(0,2))+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,250);
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:!!c,count:c?c.itemCount:0,added:updatedIds.length,err:errMsg,debug:debug}));
     }).catch(function(e){
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:String(e),debug:'catch:'+String(e)}));
     });
   }
 
+  var buildId='';
+
   function resolveAndAdd(){
     var results=new Array(items.length).fill(null);
     var pending=items.length;
     items.forEach(function(item,i){
-      if(ctx.searchReq){
-        searchByGraphQL(item.name,function(v4id){
+      if(buildId){
+        searchViaNextData(buildId,item.name,function(v4id){
           results[i]=v4id;
           pending--;
-          if(pending===0) finalize(results);
+          if(pending===0)finalize(results);
         });
       } else {
-        // No search API captured — skip search, go straight to fallback
         pending--;
-        if(pending===0) finalize(results);
+        if(pending===0)finalize(results);
       }
     });
   }
@@ -166,7 +159,7 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
       return pid?{id:'items_'+ctx.lid+'-'+pid,qty:it.qty}:null;
     }).filter(Boolean);
     if(!pairs.length){
-      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_pairs_found',debug:'lid='+ctx.lid+' op='+ctx.searchOp+' hasReq='+(!!ctx.searchReq)}));
+      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_pairs_found',debug:'lid='+ctx.lid+' buildId='+buildId}));
       return;
     }
     addToCart(pairs);
@@ -178,17 +171,15 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
       var first=Object.values(ctx.v4ids)[0];
       var lm=first.match(/^items_([^-]+)/);if(lm)ctx.lid=lm[1];
     }
-    if(!ctx.lid){
-      try{
-        var nd=JSON.stringify(window.__NEXT_DATA__||{});
-        var m2=nd.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];
-      }catch(e){}
-    }
-    if(ctx.lid&&ctx.searchReq){resolveAndAdd();return;}
+    try{
+      var nd=window.__NEXT_DATA__||{};
+      if(!ctx.lid){var ndStr=JSON.stringify(nd);var m2=ndStr.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];}
+      if(!buildId&&nd.buildId)buildId=String(nd.buildId);
+    }catch(e){}
+    if(ctx.lid){resolveAndAdd();return;}
     n++;
     if(n<60){setTimeout(poll,500);return;}
-    // 30s timeout — if we have lid but no searchReq, try fallback (will use constructed IDs)
-    var dbg='lid='+ctx.lid+' op='+ctx.searchOp+' hasReq='+(!!ctx.searchReq)+' url='+window.location.href;
+    var dbg='lid='+ctx.lid+' buildId='+buildId+' url='+window.location.href;
     if(ctx.lid){resolveAndAdd();}
     else{window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:dbg}));}
   }
