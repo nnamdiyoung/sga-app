@@ -23,6 +23,8 @@ Deno.serve(async (req) => {
 
   const body = await req.json().catch(() => ({}))
   const storeSlug: string = body.store_slug ?? ''
+  const itemNames: string = body.item_names ?? ''
+  const cartId: string = body.cart_id ?? ''
 
   const res = await fetch(
     `https://api.github.com/repos/${GITHUB_REPO}/actions/workflows/${WORKFLOW_FILE}/dispatches`,
@@ -33,7 +35,10 @@ Deno.serve(async (req) => {
         Accept: 'application/vnd.github.v3+json',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ ref: 'main', inputs: { force_run: 'true', store_slug: storeSlug } }),
+      body: JSON.stringify({
+        ref: 'main',
+        inputs: { force_run: 'true', store_slug: storeSlug, item_names: itemNames, cart_id: cartId },
+      }),
     }
   )
 

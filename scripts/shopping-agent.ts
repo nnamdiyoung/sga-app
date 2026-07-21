@@ -460,13 +460,26 @@ Respond ONLY with JSON: { "index": N, "price": <estimated price if 0 else origin
 }
 
 async function processUser(userId: string, browser: Browser): Promise<void> {
+  // Multi-store mode: specific items + existing cart
+  const existingCartId = process.env.CART_ID || "";
+  const itemNameFilter = process.env.ITEM_NAMES
+    ? process.env.ITEM_NAMES.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
+    : [];
+  const isMultiStoreRun = existingCartId !== "" && itemNameFilter.length > 0;
+
   const [itemsRes, profileRes] = await Promise.all([
     supabase.from("grocery_items").select("name, quantity").eq("user_id", userId).eq("cleared", false),
     supabase.from("profiles").select("*").eq("user_id", userId).single(),
   ]);
 
-  const items: GroceryItem[] = itemsRes.data ?? [];
+  let items: GroceryItem[] = itemsRes.data ?? [];
   const profile: Profile = profileRes.data;
+
+  // Filter to specific items for multi-store runs
+  if (itemNameFilter.length > 0) {
+    items = items.filter((i) => itemNameFilter.includes(i.name.toLowerCase()));
+    console.log(`Multi-store run: searching for [${items.map((i) => i.name).join(", ")}]`);
+  }
 
   if (!items.length) {
     console.log(`No items for user ${userId}, skipping.`);
@@ -630,35 +643,53 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
 
   const total = selectedProducts.reduce((sum, p) => sum + (p.price ?? 0), 0);
 
-  const { data: cart, error: cartError } = await supabase
-    .from("carts")
-    .insert({ user_id: userId, status: "pending", total: parseFloat(total.toFixed(2)), platform: "instacart" })
-    .select("id")
-    .single();
+  let cartId = existingCartId;
 
-  if (cartError || !cart) throw new Error(`Failed to create cart: ${cartError?.message}`);
+  if (isMultiStoreRun) {
+    // Add to existing cart
+    await supabase.from("cart_items").insert(
+      selectedProducts.map((p) => ({ cart_id: cartId, ...p }))
+    );
+    console.log(`Multi-store: added ${selectedProducts.length} items to existing cart ${cartId}`);
+  } else {
+    // Create new cart
+    const { data: cart, error: cartError } = await supabase
+      .from("carts")
+      .insert({ user_id: userId, status: "pending", total: parseFloat(total.toFixed(2)), platform: "instacart" })
+      .select("id")
+      .single();
 
-  await supabase.from("cart_items").insert(
-    selectedProducts.map((p) => ({ cart_id: cart.id, ...p }))
-  );
+    if (cartError || !cart) throw new Error(`Failed to create cart: ${cartError?.message}`);
+    cartId = cart.id;
 
-  await supabase.from("grocery_items").update({ cleared: true }).eq("user_id", userId).eq("cleared", false);
+    await supabase.from("cart_items").insert(
+      selectedProducts.map((p) => ({ cart_id: cartId, ...p }))
+    );
 
-  const itemListHtml = selectedProducts
-    .map((p) => `<li><strong>${p.grocery_item_name}</strong> → ${p.product_name} ($${p.price.toFixed(2)} CAD)</li>`)
-    .join("\n");
+    // Clear all grocery items for a full run
+    await supabase.from("grocery_items").update({ cleared: true }).eq("user_id", userId).eq("cleared", false);
 
-  await resend.emails.send({
-    from: "onboarding@resend.dev",
-    to: userEmail,
-    subject: `🛒 Your cart is ready — ${selectedProducts.length} items, ~$${total.toFixed(2)} CAD`,
-    html: `
-      <h2>Your SGA cart is ready!</h2>
-      <p><strong>${selectedProducts.length} items</strong>, approximately <strong>$${total.toFixed(2)} CAD</strong>.</p>
-      <ul>${itemListHtml}</ul>
-      <p>Open the SGA app, go to the Cart tab, and tap <strong>Add to Instacart Cart</strong> — the app will add everything for you. Then just checkout on Instacart.</p>
-    `,
-  });
+    const unfound = selectedProducts.filter((p) => p.product_name.startsWith('Search for "'));
+    const itemListHtml = selectedProducts
+      .map((p) => `<li><strong>${p.grocery_item_name}</strong> → ${p.product_name} ($${p.price.toFixed(2)} CAD)</li>`)
+      .join("\n");
+    const unfoundNote = unfound.length > 0
+      ? `<p>⚠️ <strong>${unfound.length} item(s) not found</strong> at ${lockedStoreName}: ${unfound.map((p) => p.grocery_item_name).join(", ")}. Open the app to search other stores.</p>`
+      : "";
+
+    await resend.emails.send({
+      from: "onboarding@resend.dev",
+      to: userEmail,
+      subject: `🛒 Your cart is ready — ${selectedProducts.length} items, ~$${total.toFixed(2)} CAD`,
+      html: `
+        <h2>Your SGA cart is ready!</h2>
+        <p><strong>${selectedProducts.length} items</strong>, approximately <strong>$${total.toFixed(2)} CAD</strong>.</p>
+        <ul>${itemListHtml}</ul>
+        ${unfoundNote}
+        <p>Open the SGA app, go to the Cart tab, and tap <strong>Add to Instacart Cart</strong>.</p>
+      `,
+    });
+  }
 
   console.log(`\nDone for user ${userId}: ${selectedProducts.length} items, $${total.toFixed(2)} CAD.`);
 }
