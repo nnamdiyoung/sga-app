@@ -20,9 +20,7 @@ interface Profile {
   dietary: string[];
   allergies: string[];
   brands: string;
-  instacart_session: string;
-  preferred_store_slug?: string;
-  preferred_location_id?: string;
+  walmart_session: string;
 }
 
 interface GroceryItem {
@@ -35,7 +33,6 @@ interface SearchResult {
   price: number;
   image: string;
   product_url: string;
-  instacart_item_id: string;
 }
 
 interface SelectedProduct {
@@ -47,7 +44,6 @@ interface SelectedProduct {
   store: string;
   swapped: boolean;
   quantity: string;
-  instacart_item_id: string;
 }
 
 // ─── Schedule ────────────────────────────────────────────────────────────────
@@ -93,35 +89,23 @@ async function saveScreenshot(page: Page, label: string): Promise<void> {
   } catch { /* non-fatal */ }
 }
 
-function slugToStoreName(slug: string): string {
-  return slug
-    .replace(/-(?:on|qc|bc|ab|mb|sk|ns|nb|pe|nl|nt|yt|nu)$/i, "")
-    .replace(/-/g, " ")
-    .split(" ")
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(" ");
-}
+// ─── Walmart search (intercepts API responses) ────────────────────────────────
 
-// ─── Instacart search (intercepts API responses) ───────────────────────────
-
-async function searchInstacart(
+async function searchWalmart(
   page: Page,
-  query: string,
-  storeSlug?: string
-): Promise<{ results: SearchResult[]; detectedStoreSlug: string }> {
+  query: string
+): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
 
   function extractPrice(p: any): number {
-    // Try every known Instacart price field path (numeric and string display)
     const candidates = [
-      p.price, p.unit_price, p.unitPrice,
+      p.price, p.salePrice, p.currentPrice,
+      p.priceInfo?.currentPrice?.price,
+      p.priceInfo?.wasPrice?.price,
       p.pricing?.price, p.pricing?.unit_price, p.pricing?.unitPrice,
       p.pricing?.display_price, p.pricing?.displayPrice, p.pricing?.displayString,
       p.pricing?.display_string, p.attributes?.price,
       p.displayPrice, p.display_price, p.priceString, p.price_string,
-      // nested item wrapper (GraphQL)
-      p.item?.price, p.item?.pricing?.price, p.item?.pricing?.displayPrice,
-      p.item?.pricing?.displayString,
     ];
     for (const v of candidates) {
       if (v == null) continue;
@@ -133,14 +117,21 @@ async function searchInstacart(
 
   const handler = async (response: any) => {
     const url: string = response.url();
-    if (!url.includes("instacart")) return;
+    if (!url.includes("walmart")) return;
     if (!(response.headers()["content-type"] ?? "").includes("application/json")) return;
     try {
       const json = await response.json();
       const candidates: any[] =
-        json?.items ?? json?.results ?? json?.products ??
-        json?.data?.items ?? json?.data?.products ?? json?.data?.search?.products ??
-        json?.modules?.flatMap((m: any) => m.items ?? m.products ?? []) ?? [];
+        json?.items ??
+        json?.products ??
+        json?.payload?.products ??
+        json?.searchContent?.products ??
+        json?.results ??
+        json?.data?.items ??
+        json?.data?.products ??
+        json?.data?.search?.products ??
+        json?.modules?.flatMap((m: any) => m.items ?? m.products ?? []) ??
+        [];
 
       if (candidates.length > 0 && results.length === 0) {
         console.log('[PRICE DEBUG] First candidate keys:', Object.keys(candidates[0]));
@@ -151,22 +142,20 @@ async function searchInstacart(
         if (results.length >= 8) break;
         const name = p.name ?? p.display_name ?? p.displayName ?? p.title;
         if (!name) continue;
-        const itemId: string = String(p.id ?? p.item_id ?? p.itemId ?? "");
-        const productId: string = String(p.productId ?? p.legacyId ?? p.legacy_id ?? "");
-        const numericId = productId || itemId.match(/(\d+)$/)?.[1] || "";
-        let product_url = p.url ?? p.product_url ?? "";
-        if (numericId) product_url = `https://www.instacart.ca/products/${numericId}`;
-
-        // Try to get the full "items_{locationId}-{productId}" format directly from the API
-        const rawId = String(p.id ?? p.item_id ?? p.itemId ?? p.v4ItemId ?? p.v4_item_id ?? '')
-        const fullItemId = /^items_\d+-\d+$/.test(rawId) ? rawId : ''
+        const productId: string = String(
+          p.productId ?? p.itemId ?? p.id ?? p.item_id ?? ""
+        );
+        const imageUrl: string =
+          p.imageUrl ?? p.image?.url ?? p.image ?? p.photo ?? "";
+        const product_url = productId
+          ? `https://www.walmart.ca/en/ip/${productId}`
+          : (p.productPageUrl ?? p.canonicalUrl ?? "");
 
         results.push({
           name,
           price: extractPrice(p),
-          image: p.image_url ?? p.image ?? p.photo ?? p.imageUrl ?? "",
+          image: imageUrl,
           product_url,
-          instacart_item_id: fullItemId,
         });
       }
     } catch { /* skip */ }
@@ -174,17 +163,11 @@ async function searchInstacart(
 
   page.on("response", handler);
 
-  // Use store-specific URL when we have the user's preferred slug, else fall back to generic.
-  const searchUrl = storeSlug
-    ? `https://www.instacart.ca/store/${storeSlug}/search_v3?k=${encodeURIComponent(query)}`
-    : `https://www.instacart.ca/store/s?k=${encodeURIComponent(query)}`;
+  const searchUrl = `https://www.walmart.ca/search?q=${encodeURIComponent(query)}`;
 
-  let detectedStoreSlug = "";
   try {
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
     await page.waitForTimeout(7000);
-    const match = page.url().match(/\/store\/([^/?#]+)/);
-    if (match && match[1] !== "s") detectedStoreSlug = match[1];
     await saveScreenshot(page, `search-${query.replace(/\s/g, "_").substring(0, 15)}`);
   } catch (err) {
     console.log(`Search navigation error: ${err}`);
@@ -192,29 +175,16 @@ async function searchInstacart(
 
   page.off("response", handler);
 
-  // Rewrite generic /products/{id} URLs to store-specific ones so WebView sees
-  // an active-store product page (with "Add to cart") rather than the storeless
-  // page that shows "Buy now at Instacart" and requires a store picker flow.
-  if (detectedStoreSlug) {
-    for (const result of results) {
-      const idMatch = result.product_url.match(/\/products\/(\d+)/);
-      if (idMatch) {
-        result.product_url = `https://www.instacart.ca/store/${detectedStoreSlug}/products/${idMatch[1]}`;
-      }
-    }
-  }
-
-  const detectedLid = results.find(r => r.instacart_item_id)?.instacart_item_id?.match(/^items_([^-]+)/)?.[1] ?? '';
-  console.log(`Search "${query}" → ${results.length} results (store: ${detectedStoreSlug || "unknown"}, lid: ${detectedLid || "unknown"})`);
-  return { results, detectedStoreSlug };
+  console.log(`Search "${query}" → ${results.length} results`);
+  return results;
 }
 
 // ─── Agentic full-basket shopper ─────────────────────────────────────────────
 
 const SHOPPING_TOOLS: Anthropic.Tool[] = [
   {
-    name: "search_instacart",
-    description: "Search Instacart for a product. Returns products with names, prices, URLs, and which store they're from. If you get 0 results, try a shorter or simpler search term.",
+    name: "search_walmart",
+    description: "Search Walmart Canada for a product. Returns products with names, prices, and URLs. If you get 0 results, try a shorter or simpler search term.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -241,9 +211,8 @@ const SHOPPING_TOOLS: Anthropic.Tool[] = [
               image_url: { type: "string", description: "Image URL (empty string if none)" },
               store: { type: "string", description: "Store name" },
               not_found: { type: "boolean", description: "True if item couldn't be found after trying" },
-              instacart_item_id: { type: "string", description: "Full Instacart item ID like items_35816-17880670 (use 'unknown' if not available)" },
             },
-            required: ["grocery_item_name", "product_name", "price", "product_url", "image_url", "store", "not_found", "instacart_item_id"],
+            required: ["grocery_item_name", "product_name", "price", "product_url", "image_url", "store", "not_found"],
           },
         },
       },
@@ -256,22 +225,17 @@ async function shopForGroceries(
   page: Page,
   items: GroceryItem[],
   profile: Profile,
-  preferredStore?: string,
-  preferredSlug?: string,
 ): Promise<SelectedProduct[]> {
   const itemList = items.map(i =>
     i.quantity && i.quantity !== '1'
       ? `- ${i.name} [buy ${i.quantity}]`
       : `- ${i.name}`
   ).join("\n");
-  const storeHint = preferredStore
-    ? `\nStore preference: The user wants to shop at ${preferredStore}. Search there first. Only look elsewhere if something is genuinely unavailable.`
-    : "";
 
   const messages: Anthropic.MessageParam[] = [
     {
       role: "user",
-      content: `You are a smart grocery shopper. Buy the following items on Instacart Canada:
+      content: `You are a smart grocery shopper. Buy the following items on Walmart Canada:
 
 ${itemList}
 
@@ -279,26 +243,17 @@ User preferences:
 - Budget: $${profile.budget ?? "flexible"} CAD
 - Dietary: ${profile.dietary?.join(", ") || "none"}
 - Allergies: ${profile.allergies?.join(", ") || "none"}
-- Preferred brands: ${profile.brands || "no strong preference"}${storeHint}
+- Preferred brands: ${profile.brands || "no strong preference"}
 
 Shopping strategy:
-- **Strongly prefer one store** — the user gets one checkout, one delivery. This matters a lot.
-- Identify which store Instacart defaults to from your first search, then commit to it.
-- Only switch stores if an item is genuinely unavailable after 2 search attempts, OR if the price difference is extreme (e.g. 50%+ cheaper elsewhere for a high-cost item).
-- Never split stores just because another store is slightly cheaper — the convenience of one checkout is worth a few dollars.
 - Respect dietary restrictions and allergies strictly — never pick something that violates them.
-- If budget is set and total looks high, prefer store-brand or value options within the same store before going elsewhere.
+- If budget is set and total looks high, prefer store-brand or value options.
 - If a search returns 0 results, try a simpler term before giving up.
 - Once you have everything (or genuinely exhausted options), call finalize_cart.
 
 Use your judgment. Be decisive.`,
     },
   ];
-
-  // Map product_url → instacart_item_id so we don't rely on Claude echoing it back
-  const itemIdByUrl = new Map<string, string>();
-  // Track the store slug across searches — start with user's preferred store
-  let currentSlug = preferredSlug ?? '';
 
   let finalSelections: SelectedProduct[] = [];
   let isDone = false;
@@ -320,22 +275,14 @@ Use your judgment. Be decisive.`,
     for (const block of response.content) {
       if (block.type !== "tool_use") continue;
 
-      if (block.name === "search_instacart") {
+      if (block.name === "search_walmart") {
         const { query } = block.input as { query: string };
-        const { results, detectedStoreSlug } = await searchInstacart(page, query, currentSlug || undefined);
-        // Lock in the slug after the first successful detection so all searches use the same store
-        if (detectedStoreSlug && !currentSlug) currentSlug = detectedStoreSlug;
-        const storeName = slugToStoreName(currentSlug || detectedStoreSlug || 'instacart');
-
-        // Store itemIds by URL so we can look them up at finalize time
-        for (const r of results) {
-          if (r.product_url && r.instacart_item_id) itemIdByUrl.set(r.product_url, r.instacart_item_id);
-        }
+        const results = await searchWalmart(page, query);
 
         const resultText = results.length > 0
-          ? `Found ${results.length} products at ${storeName}:\n` +
+          ? `Found ${results.length} products at Walmart Canada:\n` +
             results.map((r, i) =>
-              `${i + 1}. ${r.name} — $${r.price > 0 ? r.price : "price not shown"} CAD | URL: ${r.product_url} | ItemID: ${r.instacart_item_id || 'unknown'} | Image: ${r.image}`
+              `${i + 1}. ${r.name} — $${r.price > 0 ? r.price : "price not shown"} CAD | URL: ${r.product_url} | Image: ${r.image}`
             ).join("\n")
           : `No results for "${query}". Try a simpler or different search term.`;
 
@@ -347,7 +294,6 @@ Use your judgment. Be decisive.`,
           selections: Array<{
             grocery_item_name: string; product_name: string; price: number;
             product_url: string; image_url: string; store: string; not_found: boolean;
-            instacart_item_id: string;
           }>;
         };
 
@@ -363,12 +309,10 @@ Use your judgment. Be decisive.`,
             product_name: s.not_found ? `Search for "${s.grocery_item_name}"` : s.product_name,
             price: s.price,
             image_url: s.image_url,
-            product_url: s.product_url || `https://www.instacart.ca/store/s?k=${encodeURIComponent(s.grocery_item_name)}`,
+            product_url: s.product_url || `https://www.walmart.ca/search?q=${encodeURIComponent(s.grocery_item_name)}`,
             store: s.store,
             swapped: false,
             quantity: original?.quantity ?? "1",
-            // Look up directly from search results — don't trust Claude's echo of the ID
-            instacart_item_id: itemIdByUrl.get(s.product_url) ?? s.instacart_item_id ?? '',
           };
         });
 
@@ -431,7 +375,7 @@ Return ONLY the JSON array, no other text.`,
   return selectedProducts;
 }
 
-// ─── Claude-guided Instacart cart addition (vision) ──────────────────────────
+// ─── Claude-guided Walmart cart addition (vision) ─────────────────────────────
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
   const chunks: T[][] = [];
@@ -463,7 +407,7 @@ async function addProductWithClaude(page: Page, product: SelectedProduct, worker
             { type: "image", source: { type: "base64", media_type: "image/png", data: screenshot } },
             {
               type: "text",
-              text: `Instacart Canada product page. Add "${product.product_name}" to cart.
+              text: `Walmart Canada product page. Add "${product.product_name}" to cart.
 
 Reply with exactly one of:
 CLICK: <exact text on the Add to cart button>
@@ -515,7 +459,7 @@ async function addProductsParallel(browser: Browser, profile: Profile, products:
 
   const WORKERS = Math.min(3, valid.length);
   const chunks = chunkArray(valid, Math.ceil(valid.length / WORKERS));
-  console.log(`\nAdding ${valid.length} items to Instacart (${WORKERS} parallel workers)...`);
+  console.log(`\nAdding ${valid.length} items to Walmart (${WORKERS} parallel workers)...`);
 
   const counts = await Promise.all(
     chunks.map(async (chunk, idx) => {
@@ -540,7 +484,7 @@ async function addProductsParallel(browser: Browser, profile: Profile, products:
 async function generateEmailSummary(
   selectedProducts: SelectedProduct[],
   total: number,
-  instacartAdded: boolean,
+  walmartAdded: boolean,
   addedCount: number,
 ): Promise<string> {
   const found = selectedProducts.filter(p => !p.product_name.startsWith('Search for "'));
@@ -552,9 +496,9 @@ async function generateEmailSummary(
     stores.length > 0 ? `Store(s): ${stores.join(", ")}.` : "",
     `Estimated total: ~$${total.toFixed(2)} CAD.`,
     notFound.length > 0 ? `Not found: ${notFound.map(p => p.grocery_item_name).join(", ")}.` : "",
-    instacartAdded
-      ? `Successfully added ${addedCount} item(s) directly to the user's Instacart cart.`
-      : "Items were not automatically added to Instacart (session may have expired).",
+    walmartAdded
+      ? `Successfully added ${addedCount} item(s) directly to the user's Walmart cart.`
+      : "Items were not automatically added to Walmart (session may have expired).",
   ].filter(Boolean).join(" ");
 
   const itemLines = found.map(p =>
@@ -582,7 +526,7 @@ Instructions:
 - Start with a short punchy line (1 sentence) — make it fun, not corporate
 - Then show the item list as HTML: each item on its own line with a relevant food emoji at the start, the product name, and price. Use <ul> with no bullets (list-style:none), each <li> styled with padding.
 - If items weren't found, mention them briefly at the end with a 😅 or similar
-- End with a clear call to action: ${instacartAdded ? '"Your Instacart cart is loaded — just open Instacart and checkout! 🎉"' : '"Open SGA → Cart tab to add your items to Instacart"'}
+- End with a clear call to action: ${walmartAdded ? '"Your Walmart cart is loaded — just open walmart.ca and checkout! 🎉"' : '"Open SGA → Cart tab to add your items to Walmart"'}
 - Keep the whole thing under 200 words
 - Output ONLY raw HTML — no markdown, no backticks, no code fences, no \`\`\`html wrapper
 - Start your response directly with the first HTML element`,
@@ -607,8 +551,8 @@ async function buildBrowserContext(browser: Browser, profile: Profile) {
   };
 
   let sessionData: SessionData = {};
-  if (profile?.instacart_session) {
-    try { sessionData = JSON.parse(profile.instacart_session); } catch { /* skip */ }
+  if (profile?.walmart_session) {
+    try { sessionData = JSON.parse(profile.walmart_session); } catch { /* skip */ }
   }
 
   if (sessionData.storageState) {
@@ -641,7 +585,7 @@ async function buildBrowserContext(browser: Browser, profile: Profile) {
       .map((c) => {
         const eq = c.indexOf("=");
         if (eq === -1) return null;
-        return { name: c.substring(0, eq).trim(), value: c.substring(eq + 1).trim(), domain: ".instacart.ca", path: "/" };
+        return { name: c.substring(0, eq).trim(), value: c.substring(eq + 1).trim(), domain: ".walmart.ca", path: "/" };
       })
       .filter((c): c is NonNullable<typeof c> => !!c?.name && !!c?.value);
     if (parsed.length > 0) {
@@ -656,24 +600,13 @@ async function buildBrowserContext(browser: Browser, profile: Profile) {
 // ─── Process one user ─────────────────────────────────────────────────────────
 
 async function processUser(userId: string, browser: Browser): Promise<void> {
-  const existingCartId = process.env.CART_ID ?? "";
-  const itemNameFilter = process.env.ITEM_NAMES
-    ? process.env.ITEM_NAMES.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
-    : [];
-  const isMultiStoreRun = existingCartId !== "" && itemNameFilter.length > 0;
-
   const [itemsRes, profileRes] = await Promise.all([
     supabase.from("grocery_items").select("name, quantity").eq("user_id", userId).eq("cleared", false),
     supabase.from("profiles").select("*").eq("user_id", userId).single(),
   ]);
 
-  let items: GroceryItem[] = itemsRes.data ?? [];
+  const items: GroceryItem[] = itemsRes.data ?? [];
   const profile: Profile = profileRes.data;
-
-  if (itemNameFilter.length > 0) {
-    items = items.filter((i) => itemNameFilter.includes(i.name.toLowerCase()));
-    console.log(`Multi-store run: [${items.map((i) => i.name).join(", ")}]`);
-  }
 
   if (!items.length) { console.log(`No items for ${userId}`); return; }
 
@@ -686,13 +619,8 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   const context = await buildBrowserContext(browser, profile);
   const page = await context.newPage();
 
-  const preferredSlug = process.env.STORE_SLUG ?? profile.preferred_store_slug ?? undefined;
-  const preferredStore = preferredSlug ? slugToStoreName(preferredSlug) : null;
-  if (preferredSlug) console.log(`Using store slug: ${preferredSlug} (store: ${preferredStore})`);
-  if (profile.preferred_location_id) console.log(`User's last known retailerLocationId: ${profile.preferred_location_id}`);
-
   console.log(`\nStarting agentic shop for ${items.length} items...`);
-  const selectedProducts = await shopForGroceries(page, items, profile, preferredStore ?? undefined, preferredSlug);
+  const selectedProducts = await shopForGroceries(page, items, profile);
 
   // Claude reviews the cart for obvious errors (wrong category, allergen violations, etc.)
   const validatedProducts = await validateCartWithClaude(selectedProducts, items, profile);
@@ -705,28 +633,20 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
 
   await context.close();
 
-  // Add directly to the user's Instacart cart — parallel Claude-vision workers
-  let instacartAdded = false;
+  // Add directly to the user's Walmart cart — parallel Claude-vision workers
+  let walmartAdded = false;
   let addedCount = 0;
-  if (profile.instacart_session) {
+  if (profile.walmart_session) {
     addedCount = await addProductsParallel(browser, profile, validatedProducts);
-    instacartAdded = addedCount > 0;
-    console.log(`Instacart: ${addedCount}/${validatedProducts.filter(p => !p.product_name.startsWith('Search for "')).length} items added`);
+    walmartAdded = addedCount > 0;
+    console.log(`Walmart: ${addedCount}/${validatedProducts.filter(p => !p.product_name.startsWith('Search for "')).length} items added`);
   }
 
   const total = validatedProducts.reduce((sum, p) => sum + (p.price ?? 0), 0);
 
-  if (isMultiStoreRun) {
-    await supabase.from("cart_items").insert(
-      validatedProducts.map((p) => ({ cart_id: existingCartId, ...p }))
-    );
-    console.log(`Multi-store: added ${validatedProducts.length} items to cart ${existingCartId}`);
-    return;
-  }
-
   const { data: cart, error: cartError } = await supabase
     .from("carts")
-    .insert({ user_id: userId, status: "pending", total: parseFloat(total.toFixed(2)), platform: "instacart" })
+    .insert({ user_id: userId, status: "pending", total: parseFloat(total.toFixed(2)), platform: "walmart" })
     .select("id")
     .single();
 
@@ -735,9 +655,9 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   await supabase.from("cart_items").insert(validatedProducts.map((p) => ({ cart_id: cart.id, ...p })));
   await supabase.from("grocery_items").update({ cleared: true }).eq("user_id", userId).eq("cleared", false);
 
-  const emailBody = await generateEmailSummary(validatedProducts, total, instacartAdded, addedCount);
-  const subject = instacartAdded
-    ? `✅ ${addedCount} items added to Instacart — ~$${total.toFixed(2)} CAD`
+  const emailBody = await generateEmailSummary(validatedProducts, total, walmartAdded, addedCount);
+  const subject = walmartAdded
+    ? `✅ ${addedCount} items added to Walmart — ~$${total.toFixed(2)} CAD`
     : `🛒 Cart ready — ${validatedProducts.length} items ~$${total.toFixed(2)} CAD`;
 
   await resend.emails.send({
@@ -747,7 +667,7 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
     html: emailBody,
   });
 
-  console.log(`\nDone: ${validatedProducts.length} items, $${total.toFixed(2)} CAD, Instacart added: ${instacartAdded}`);
+  console.log(`\nDone: ${validatedProducts.length} items, $${total.toFixed(2)} CAD, Walmart added: ${walmartAdded}`);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────

@@ -1,240 +1,12 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   View, Text, TouchableOpacity, FlatList,
-  StyleSheet, SafeAreaView, Image, Modal, ActivityIndicator, Linking, RefreshControl, Animated
+  StyleSheet, SafeAreaView, Image, Linking, RefreshControl, Animated
 } from 'react-native'
-import { useRouter } from 'expo-router'
 import { Ionicons } from '@expo/vector-icons'
-import { WebView } from 'react-native-webview'
-import type { WebView as WebViewType } from 'react-native-webview'
 import { supabase } from '../../lib/supabase'
 import { colors, spacing, radius, font } from '../../lib/theme'
 import type { Cart, CartItem } from '../../lib/types'
-
-// ---------------------------------------------------------------------------
-// Intercept fetch calls made by Instacart's own page to capture cartId and
-// retailerLocationId before we inject the mutation.
-// ---------------------------------------------------------------------------
-const INSTACART_INTERCEPT_JS = `
-window.__ctx={lid:null,slug:null,lidSaved:false,v4ids:{},searchURL:'',fetchCount:0,fetchUrls:[]};
-(function(){
-  function scan(s,url){
-    if(!window.__ctx.lid){var m2=s.match(/"retailerLocationId":"([^"]+)"/);if(m2)window.__ctx.lid=m2[1];}
-    if(!window.__ctx.slug){var ms=s.match(/"(?:storeSlug|retailerSlug|store_slug)":"([a-z][a-z0-9-]{2,50})"/);if(ms)window.__ctx.slug=ms[1];}
-    // Capture v4ItemIds from named fields (v4ItemId, itemId, etc.) AND from bare "id" fields
-    var re=/"(?:v4ItemId|v4_item_id|itemId|item_id)":"(items_([^-"]+)-([^"]+))"/g;var mx;
-    while((mx=re.exec(s))!==null){window.__ctx.v4ids[mx[3]]=mx[1];}
-    var re2=/"id":"(items_(\d+)-(\d+))"/g;
-    while((mx=re2.exec(s))!==null){window.__ctx.v4ids[mx[3]]=mx[1];}
-    // Save the URL of the first response that contains items_ IDs — we replay it per item name
-    if(!window.__ctx.searchURL&&url&&s.indexOf('"items_')!==-1){window.__ctx.searchURL=url;}
-    if(!window.__ctx.lid&&Object.keys(window.__ctx.v4ids).length>0){
-      var first=Object.values(window.__ctx.v4ids)[0];
-      var lm=first.match(/^items_([^-]+)/);if(lm)window.__ctx.lid=lm[1];
-    }
-    if(window.__ctx.lid&&!window.__ctx.lidSaved){
-      window.__ctx.lidSaved=true;
-      window.ReactNativeWebView.postMessage(JSON.stringify({type:'lid',lid:window.__ctx.lid,slug:window.__ctx.slug||null}));
-    }
-  }
-  var fo=window.fetch;window.__f=fo;
-  window.fetch=function(input,init){
-    var url=typeof input==='string'?input:(input&&input.url?input.url:'');
-    window.__ctx.fetchCount++;
-    if(window.__ctx.fetchUrls.length<6)window.__ctx.fetchUrls.push(url.substring(0,100));
-    return fo.apply(this,arguments).then(function(r){
-      r.clone().text().then(function(t){try{scan(t,url);}catch(e){}}).catch(function(){});
-      return r;
-    });
-  };
-  var XO=window.XMLHttpRequest;
-  window.XMLHttpRequest=function(){
-    var x=new XO();
-    var xhrUrl='';
-    x.open=function(){xhrUrl=String(arguments[1]||'');return XO.prototype.open.apply(x,arguments);};
-    x.addEventListener('readystatechange',function(){
-      if(x.readyState===4){try{scan(x.responseText,xhrUrl);}catch(e){}}
-    });
-    return x;
-  };
-  window.XMLHttpRequest.prototype=XO.prototype;
-})();
-true;
-`
-
-// ---------------------------------------------------------------------------
-// Build the JS that fires the UpdateCartItemsMutation for all items at once.
-// itemId strategy:
-//   1. For item[0]: read v4ItemId from the already-loaded search page's __NEXT_DATA__
-//      or ctx.v4ids captured by the intercept
-//   2. For all items: fetch the search page HTML (same-origin, cookies included) and
-//      scan for "v4ItemId":"items_..." — this gives location-correct IDs at the user's
-//      retailer location, same as what the Playwright agent intercepts
-//   3. Last resort: construct "items_" + ctx.lid + "-" + productId from stored URL
-// ---------------------------------------------------------------------------
-function makeAddJS(items: { productUrl: string; qty: number; name: string }[], preferredSlug: string): string {
-  return `(function(items,preferredSlug){
-  var ctx=window.__ctx;var f=window.__f||window.fetch;
-
-  function extractV4Id(text){
-    var m=text.match(/"(?:v4ItemId|v4_item_id|itemId|item_id)":"(items_[^"]+)"/);
-    if(m)return m[1];
-    m=text.match(/"id":"(items_\\d+-\\d+)"/);
-    return m?m[1]:null;
-  }
-
-  // Extract v4ItemId from a JSON object (modules/items/products structure Instacart uses)
-  function extractV4IdFromJSON(d){
-    var candidates=[];
-    try{
-      if(d.modules)for(var mi=0;mi<d.modules.length;mi++){var m=d.modules[mi];var arr=m.items||m.products||[];for(var pi=0;pi<arr.length;pi++)candidates.push(arr[pi]);}
-      if(d.items)for(var ii=0;ii<d.items.length;ii++)candidates.push(d.items[ii]);
-      if(d.products)for(var ip=0;ip<d.products.length;ip++)candidates.push(d.products[ip]);
-      if(d.data&&d.data.search&&d.data.search.products)for(var sp=0;sp<d.data.search.products.length;sp++)candidates.push(d.data.search.products[sp]);
-    }catch(e){}
-    for(var ci=0;ci<candidates.length;ci++){
-      var p=candidates[ci];
-      var pid=String(p.id||p.itemId||p.item_id||p.v4ItemId||p.v4_item_id||'');
-      if(/^items_\\d+-\\d+$/.test(pid))return pid;
-    }
-    return null;
-  }
-
-  // Search for an item by name and return its v4ItemId at the user's location.
-  // Strategy: 1) replay the captured search API URL, 2) HTML fetch as fallback.
-  function searchForV4Id(name,isFirst,cb){
-    var done=false;
-    var timer=setTimeout(function(){if(!done){done=true;cb(null);}},12000);
-    function finish(v4id){if(!done){done=true;clearTimeout(timer);cb(v4id);}}
-
-    // For item[0]: if intercept already captured v4ids from the page-load search, use the first one
-    if(isFirst&&Object.keys(ctx.v4ids).length>0){finish(Object.values(ctx.v4ids)[0]);return;}
-
-    // Try replaying the captured search API URL with this item's name
-    if(ctx.searchURL){
-      var slug=ctx.slug||preferredSlug||'';
-      // Replace the term/k/q parameter in the URL
-      var apiUrl=ctx.searchURL.replace(/([?&](?:term|k|q|query|search_term|searchTerm)=)[^&]*/i,'$1'+encodeURIComponent(name));
-      if(apiUrl===ctx.searchURL){apiUrl+=(ctx.searchURL.indexOf('?')>=0?'&':'?')+'term='+encodeURIComponent(name);}
-      f(apiUrl,{credentials:'include',headers:{'Accept':'application/json'}})
-        .then(function(r){return r.json();})
-        .then(function(d){
-          var v4id=extractV4IdFromJSON(d);
-          if(v4id){
-            if(!ctx.lid){var lm=v4id.match(/^items_([^-]+)/);if(lm)ctx.lid=lm[1];}
-            finish(v4id);
-          } else {tryHTML();}
-        })
-        .catch(tryHTML);
-    } else {
-      tryHTML();
-    }
-
-    function tryHTML(){
-      if(done)return;
-      var slug=ctx.slug||preferredSlug||'';
-      var path=slug?'/store/'+slug+'/search_v3?k='+encodeURIComponent(name):'/store/s?k='+encodeURIComponent(name);
-      f(path,{credentials:'include'})
-        .then(function(r){return r.text();})
-        .then(function(html){
-          if(!ctx.lid){var m2=html.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];}
-          if(!ctx.slug){var ms=html.match(/"(?:storeSlug|retailerSlug|store_slug)":"([a-z][a-z0-9-]{2,50})"/);if(ms)ctx.slug=ms[1];}
-          var v4id=extractV4Id(html);
-          if(!v4id){v4id=extractV4IdFromJSON(JSON.parse(html.match(/"__NEXT_DATA__[^>]*>([^<]+)/)?.[1]||'{}'));}
-          finish(v4id);
-        })
-        .catch(function(){finish(null);});
-    }
-  }
-
-  function addToCart(pairs){
-    var updates=pairs.map(function(p){return{itemId:p.id,quantity:p.qty,quantityType:'each',trackingParams:{attributionMetadata:{shopId:'',nestedShopId:''},trackingProperties:{}}};});
-    f('/graphql?operationName=UpdateCartItemsMutation',{
-      method:'POST',
-      headers:{'Content-Type':'application/json','x-client-identifier':'web'},
-      credentials:'include',
-      body:JSON.stringify({
-        operationName:'UpdateCartItemsMutation',
-        variables:{cartId:ctx.lid,cartItemUpdates:updates,cartType:'grocery',requestTimestamp:Date.now()},
-        extensions:{persistedQuery:{version:1,sha256Hash:'ba4bf465d294d1d528d82a4ac48ac13980d528149874c0e52082dc1d833bdb09'}}
-      })
-    }).then(function(r){return r.json();}).then(function(d){
-      var c=d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.cart;
-      var updatedIds=(d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.updatedItemIds)||[];
-      var errMsg=d.errors?d.errors[0].message:null;
-      var ids=pairs.map(function(p){return p.id;});
-      var debug='lid='+ctx.lid+' slug='+(ctx.slug||preferredSlug)+' searchURL='+(ctx.searchURL||'none').substring(0,60)+' ids='+JSON.stringify(ids.slice(0,2))+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,200);
-      window.ReactNativeWebView.postMessage(JSON.stringify({ok:!!c,count:c?c.itemCount:0,added:updatedIds.length,err:errMsg,debug:debug}));
-    }).catch(function(e){
-      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:String(e),debug:'catch:'+String(e)}));
-    });
-  }
-
-  function resolveAndAdd(){
-    var results=new Array(items.length).fill(null);
-    var pending=items.length;
-    if(pending===0){finalize(results);return;}
-    items.forEach(function(item,i){
-      searchForV4Id(item.name,i===0,function(v4id){
-        results[i]=v4id;
-        if(--pending===0)finalize(results);
-      });
-    });
-  }
-
-  function finalize(results){
-    var slug=ctx.slug||preferredSlug||'';
-    if(!ctx.lid){
-      for(var k=0;k<results.length;k++){if(results[k]){var lmf=results[k].match(/^items_([^-]+)/);if(lmf){ctx.lid=lmf[1];break;}}}
-    }
-    var diag='lid='+ctx.lid+' slug='+slug+' fetchCount='+(ctx.fetchCount||0)+' searchURL='+(ctx.searchURL||'none').substring(0,80)+' fetchUrls='+(ctx.fetchUrls||[]).join('|').substring(0,150);
-    if(!ctx.lid){
-      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:diag}));
-      return;
-    }
-    var pairs=items.map(function(it,j){
-      if(results[j])return{id:results[j],qty:it.qty};
-      var m=it.productUrl.match(/\\/products\\/(\\d+)/);
-      return m?{id:'items_'+ctx.lid+'-'+m[1],qty:it.qty}:null;
-    }).filter(Boolean);
-    if(!pairs.length){
-      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_pairs_found',debug:diag}));
-      return;
-    }
-    addToCart(pairs);
-  }
-
-  var n=0;
-  function poll(){
-    if(!ctx.lid&&Object.keys(ctx.v4ids).length>0){var fv=Object.values(ctx.v4ids)[0];var lm=fv.match(/^items_([^-]+)/);if(lm)ctx.lid=lm[1];}
-    try{var nd=window.__NEXT_DATA__||{};if(!ctx.lid){var ndStr=JSON.stringify(nd);var m2=ndStr.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];}}catch(e){}
-    // Once lid is set OR we've waited 5s for the page to make its API calls, proceed
-    if(ctx.lid||(ctx.searchURL&&Object.keys(ctx.v4ids).length>0)){resolveAndAdd();return;}
-    n++;if(n<10){setTimeout(poll,500);return;}
-    resolveAndAdd();
-  }
-  poll();
-})(${JSON.stringify(items)},${JSON.stringify(preferredSlug)});
-true;`
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-function extractProductId(url: string): string | null {
-  const m = url.match(/\/products\/(\d+)/)
-  return m ? m[1] : null
-}
-
-function parseQty(quantity?: string): number {
-  if (!quantity) return 1
-  const trimmed = quantity.trim()
-  if (/^\d+$/.test(trimmed)) {
-    const n = parseInt(trimmed, 10)
-    return Math.max(1, Math.min(n, 20))
-  }
-  return 1
-}
 
 // ---------------------------------------------------------------------------
 // Component
@@ -244,20 +16,7 @@ export default function CartScreen() {
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [aiSummary, setAISummary] = useState<string | null>(null)
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
 
-  // Instacart GraphQL flow state
-  const [instacartPhase, setInstacartPhase] = useState<'idle' | 'loading' | 'adding' | 'done' | 'error'>('idle')
-  const [instacartCount, setInstacartCount] = useState(0)
-  const [showInstacartFlow, setShowInstacartFlow] = useState(false)
-  const [instacartDebug, setInstacartDebug] = useState<string | null>(null)
-  const [webViewKey, setWebViewKey] = useState(0)
-  const [instacartUrl, setInstacartUrl] = useState('https://www.instacart.ca')
-
-  const router = useRouter()
-  const instacartWebViewRef = useRef<WebViewType>(null)
-  const pendingItemsRef = useRef<{ productUrl: string; qty: number; name: string }[]>([])
-  const pendingSlugRef = useRef<string>('')
   const toastAnim = useRef(new Animated.Value(-80)).current
 
   useEffect(() => {
@@ -312,7 +71,6 @@ export default function CartScreen() {
     setRefreshing(false)
 
     if (newCart?.items?.length) {
-      setSelectedIds(new Set(newCart.items.map((i: CartItem) => i.id)))
       fetchAISummary(newCart.items)
     }
   }
@@ -350,100 +108,6 @@ export default function CartScreen() {
     if (!cart) return
     await supabase.from('carts').update({ status: 'checked_out' }).eq('id', cart.id)
     setCart(null)
-  }
-
-  function toggleItem(id: string) {
-    setSelectedIds(prev => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-  }
-
-  function toggleAll() {
-    if (!cart) return
-    if (selectedIds.size === cart.items.length) {
-      setSelectedIds(new Set())
-    } else {
-      setSelectedIds(new Set(cart.items.map(i => i.id)))
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Instacart GraphQL flow
-  // ---------------------------------------------------------------------------
-  async function startInstacartAdd(cartItems: CartItem[]) {
-    const items = cartItems
-      .filter(i => !!i.product_url && !i.product_name?.startsWith('Search for "'))
-      .map(i => ({ productUrl: i.product_url, qty: parseQty(i.quantity), name: i.grocery_item_name }))
-
-    if (items.length === 0) return
-
-    // Load preferred store slug so makeAddJS can use store-specific search URLs
-    // (same path as the Playwright agent, which successfully finds v4ItemIds)
-    let storeSlug = ''
-    const { data: { user } } = await supabase.auth.getUser()
-    if (user) {
-      const { data: profile } = await supabase.from('profiles').select('preferred_store_slug').eq('user_id', user.id).single()
-      storeSlug = profile?.preferred_store_slug ?? ''
-    }
-
-    const firstItemName = items[0]?.name ?? ''
-    // Use the generic search URL — the generic /store/s page makes API calls that
-    // expose retailerLocationId so the intercept can capture lid. The store-specific
-    // URL (/store/walmart/search_v3) doesn't expose lid via client-side API calls.
-    const storeUrl = firstItemName
-      ? `https://www.instacart.ca/store/s?k=${encodeURIComponent(firstItemName)}`
-      : 'https://www.instacart.ca'
-
-    pendingItemsRef.current = items
-    pendingSlugRef.current = storeSlug
-    setInstacartUrl(storeUrl)
-    setWebViewKey(k => k + 1) // force fresh WebView mount
-    setInstacartPhase('loading')
-    setInstacartCount(0)
-    setShowInstacartFlow(true)
-  }
-
-  function handleInstacartLoad() {
-    setInstacartPhase('adding')
-    instacartWebViewRef.current?.injectJavaScript(makeAddJS(pendingItemsRef.current, pendingSlugRef.current))
-  }
-
-  async function handleInstacartMessage(event: { nativeEvent: { data: string } }) {
-    try {
-      const data = JSON.parse(event.nativeEvent.data) as {
-        type?: string; lid?: string; slug?: string | null;
-        ok?: boolean; count?: number; added?: number; err?: string | null; debug?: string
-      }
-
-      // Save lid and slug to profile so the agent always shops at the right location/store
-      if (data.type === 'lid' && data.lid) {
-        const { data: { user } } = await supabase.auth.getUser()
-        if (user) {
-          const update: Record<string, string> = { preferred_location_id: data.lid }
-          if (data.slug) update.preferred_store_slug = data.slug
-          await supabase.from('profiles').update(update).eq('user_id', user.id)
-        }
-        return
-      }
-
-      console.log('[SGA] Instacart API result:', JSON.stringify(data))
-      if (!data.ok) setInstacartDebug(data.debug ?? data.err ?? 'no detail')
-      if (data.ok) {
-        setInstacartCount(data.added ?? data.count ?? pendingItemsRef.current.length)
-        setInstacartPhase('done')
-        if (cart) {
-          await supabase.from('carts').update({ status: 'checked_out', instacart_added: true }).eq('id', cart.id)
-          setCart(null)
-        }
-      } else {
-        setInstacartPhase('error')
-      }
-    } catch {
-      setInstacartPhase('error')
-    }
   }
 
   // ---------------------------------------------------------------------------
@@ -487,13 +151,6 @@ export default function CartScreen() {
             {cart.items.length} items · AI picked on {new Date(cart.created_at).toLocaleDateString('en-CA', { month: 'short', day: 'numeric' })}
           </Text>
         </View>
-        {!cart.instacart_added && (
-          <TouchableOpacity onPress={toggleAll} style={styles.selectAllBtn}>
-            <Text style={styles.selectAllText}>
-              {selectedIds.size === cart.items.length ? 'Deselect All' : 'Select All'}
-            </Text>
-          </TouchableOpacity>
-        )}
       </View>
 
       <FlatList
@@ -514,14 +171,8 @@ export default function CartScreen() {
         renderItem={({ item }) => (
           <TouchableOpacity
             activeOpacity={0.85}
-            onPress={() => !cart?.instacart_added && toggleItem(item.id)}
-            style={[styles.cartItem, !cart?.instacart_added && !selectedIds.has(item.id) && styles.cartItemUnselected]}
+            style={styles.cartItem}
           >
-            {!cart?.instacart_added && (
-              <View style={[styles.checkbox, selectedIds.has(item.id) && styles.checkboxChecked]}>
-                {selectedIds.has(item.id) && <Text style={styles.checkboxTick}>✓</Text>}
-              </View>
-            )}
             {item.image_url ? (
               <Image
                 source={{ uri: item.image_url }}
@@ -563,102 +214,22 @@ export default function CartScreen() {
       />
 
       <View style={styles.checkoutBar}>
-        {cart.instacart_added ? (
+        {cart.walmart_added ? (
           <TouchableOpacity
             style={styles.checkoutBtn}
-            onPress={() => { Linking.openURL('https://www.instacart.ca'); markCheckedOut() }}
+            onPress={() => { Linking.openURL('https://www.walmart.ca/cart'); markCheckedOut() }}
           >
-            <Text style={styles.checkoutBtnText}>Open Instacart to Checkout →</Text>
+            <Text style={styles.checkoutBtnText}>Open Walmart Cart →</Text>
           </TouchableOpacity>
         ) : (
           <TouchableOpacity
-            style={[styles.checkoutBtn, selectedIds.size === 0 && styles.checkoutBtnDisabled]}
-            disabled={selectedIds.size === 0}
-            onPress={() => startInstacartAdd(cart.items.filter(i => selectedIds.has(i.id)))}
+            style={styles.checkoutBtn}
+            onPress={() => Linking.openURL('https://www.walmart.ca/cart')}
           >
-            <Text style={styles.checkoutBtnText}>
-              {selectedIds.size === cart.items.length
-                ? 'Add All to Instacart Cart'
-                : `Add ${selectedIds.size} Item${selectedIds.size === 1 ? '' : 's'} to Instacart`}
-            </Text>
+            <Text style={styles.checkoutBtnText}>View Cart on Walmart →</Text>
           </TouchableOpacity>
         )}
       </View>
-
-      {/* Background WebView modal — overlay always covers the Instacart page */}
-      <Modal visible={showInstacartFlow} animationType="slide" presentationStyle="fullScreen">
-        <SafeAreaView style={styles.modalContainer}>
-          {/* Background WebView — hidden behind overlay */}
-          <WebView
-            key={webViewKey}
-            ref={instacartWebViewRef}
-            source={{ uri: instacartUrl }}
-            style={{ flex: 1 }}
-            injectedJavaScriptBeforeContentLoaded={INSTACART_INTERCEPT_JS}
-            onLoad={handleInstacartLoad}
-            onMessage={handleInstacartMessage}
-            javaScriptEnabled
-            domStorageEnabled
-            sharedCookiesEnabled
-            thirdPartyCookiesEnabled
-          />
-
-          {/* Status overlay — always covers the WebView */}
-          <View style={[StyleSheet.absoluteFill, styles.instacartOverlay]}>
-            {(instacartPhase === 'loading' || instacartPhase === 'adding') && (
-              <View style={styles.instacartLoading}>
-                <Text style={styles.instacartEmoji}>🛒</Text>
-                <ActivityIndicator size="large" color={colors.primary} style={{ marginTop: spacing.md }} />
-                <Text style={styles.instacartTitle}>Adding to your Instacart cart</Text>
-                <Text style={styles.instacartSub}>
-                  {instacartPhase === 'loading' ? 'Connecting to Instacart...' : 'Adding your items...'}
-                </Text>
-              </View>
-            )}
-
-            {instacartPhase === 'done' && (
-              <View style={styles.instacartDone}>
-                <Text style={styles.instacartEmoji}>✅</Text>
-                <Text style={styles.instacartTitle}>{instacartCount} items in your Instacart cart</Text>
-                <Text style={styles.instacartSub}>Ready to checkout</Text>
-                <TouchableOpacity
-                  style={styles.openBtn}
-                  onPress={() => {
-                    Linking.openURL('https://www.instacart.ca')
-                    setShowInstacartFlow(false)
-                  }}
-                >
-                  <Text style={styles.openBtnText}>Open Instacart →</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.closeBtn} onPress={() => setShowInstacartFlow(false)}>
-                  <Text style={styles.closeBtnText}>Done</Text>
-                </TouchableOpacity>
-              </View>
-            )}
-
-            {instacartPhase === 'error' && (
-              <View style={styles.instacartError}>
-                <Text style={styles.instacartEmoji}>⚠️</Text>
-                <Text style={styles.instacartTitle}>Could not connect to Instacart</Text>
-                <Text style={styles.instacartSub}>Your session may have expired. Reconnect your account in Profile and try again.</Text>
-                {instacartDebug && <Text style={styles.debugText}>{instacartDebug}</Text>}
-                <TouchableOpacity
-                  style={styles.openBtn}
-                  onPress={() => {
-                    setShowInstacartFlow(false)
-                    router.push('/(tabs)/profile?connect=1')
-                  }}
-                >
-                  <Text style={styles.openBtnText}>Reconnect Instacart →</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.closeBtn} onPress={() => setShowInstacartFlow(false)}>
-                  <Text style={styles.closeBtnText}>Close</Text>
-                </TouchableOpacity>
-              </View>
-            )}
-          </View>
-        </SafeAreaView>
-      </Modal>
     </SafeAreaView>
   )
 }
@@ -766,42 +337,7 @@ const styles = StyleSheet.create({
     paddingVertical: 16,
     alignItems: 'center',
   },
-  checkoutBtnDisabled: {
-    backgroundColor: colors.border,
-  },
   checkoutBtnText: { color: '#fff', fontSize: font.size.md, fontWeight: '700' },
-  selectAllBtn: {
-    paddingHorizontal: spacing.sm,
-    paddingVertical: spacing.xs,
-  },
-  selectAllText: {
-    fontSize: font.size.sm,
-    color: colors.primary,
-    fontWeight: '600',
-  },
-  cartItemUnselected: {
-    opacity: 0.45,
-  },
-  checkbox: {
-    width: 22,
-    height: 22,
-    borderRadius: 6,
-    borderWidth: 2,
-    borderColor: colors.border,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginTop: 2,
-  },
-  checkboxChecked: {
-    backgroundColor: colors.primary,
-    borderColor: colors.primary,
-  },
-  checkboxTick: {
-    color: '#fff',
-    fontSize: 13,
-    fontWeight: '700',
-    lineHeight: 16,
-  },
   openInstacartBtn: {
     backgroundColor: colors.primary,
     borderRadius: radius.md,
@@ -829,59 +365,4 @@ const styles = StyleSheet.create({
     elevation: 8,
   },
   toastText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
-  // Modal
-  modalContainer: { flex: 1, backgroundColor: colors.background },
-  instacartOverlay: {
-    backgroundColor: colors.background,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: spacing.xl,
-  },
-  instacartLoading: {
-    alignItems: 'center',
-    gap: spacing.sm,
-  },
-  instacartDone: {
-    alignItems: 'center',
-    gap: spacing.md,
-    width: '100%',
-  },
-  instacartError: {
-    alignItems: 'center',
-    gap: spacing.md,
-    width: '100%',
-  },
-  instacartEmoji: {
-    fontSize: 52,
-    marginBottom: spacing.sm,
-  },
-  instacartTitle: {
-    fontSize: font.size.lg,
-    fontWeight: '700',
-    color: colors.textPrimary,
-    textAlign: 'center',
-  },
-  instacartSub: {
-    fontSize: font.size.sm,
-    color: colors.textSecondary,
-    textAlign: 'center',
-    lineHeight: 20,
-  },
-  openBtn: {
-    marginTop: spacing.md,
-    backgroundColor: colors.primary,
-    borderRadius: radius.md,
-    paddingVertical: 14,
-    paddingHorizontal: spacing.xl,
-    width: '100%',
-    alignItems: 'center',
-  },
-  openBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
-  closeBtn: {
-    paddingVertical: 12,
-    alignItems: 'center',
-    width: '100%',
-  },
-  closeBtnText: { fontSize: font.size.sm, color: colors.textSecondary },
-  debugText: { fontSize: 10, color: colors.textMuted, textAlign: 'center', marginTop: spacing.sm },
 })

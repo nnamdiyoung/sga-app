@@ -11,25 +11,21 @@ import { colors, spacing, radius, font } from '../../lib/theme'
 
 const DIETARY_OPTIONS = ['Vegetarian', 'Vegan', 'Halal', 'Kosher', 'Gluten-Free', 'Dairy-Free', 'Nut-Free']
 
-import { INSTACART_STORES } from '../../lib/stores'
 
 const CAPTURE_SESSION_JS = `
-  (function() {
+  (function(){
+    var session = {
+      cookies: document.cookie,
+      localStorage: {}
+    };
     try {
-      var ls = {};
-      for (var i = 0; i < localStorage.length; i++) {
+      for(var i = 0; i < localStorage.length; i++){
         var k = localStorage.key(i);
-        if (k) ls[k] = localStorage.getItem(k);
+        session.localStorage[k] = localStorage.getItem(k);
       }
-      window.ReactNativeWebView.postMessage(JSON.stringify({
-        cookies: document.cookie,
-        localStorage: ls
-      }));
-    } catch(e) {
-      window.ReactNativeWebView.postMessage(JSON.stringify({ error: String(e) }));
-    }
-  })();
-  true;
+    } catch(e){}
+    window.ReactNativeWebView.postMessage(JSON.stringify({type:'session',data:JSON.stringify(session)}));
+  })(); true;
 `
 
 export default function Profile() {
@@ -43,8 +39,7 @@ export default function Profile() {
   const [saving, setSaving] = useState(false)
   const [profileId, setProfileId] = useState<string | null>(null)
   const [email, setEmail] = useState('')
-  const [preferredStore, setPreferredStore] = useState('')
-  const [instacartConnected, setInstacartConnected] = useState(false)
+  const [walmartConnected, setWalmartConnected] = useState(false)
   const [showWebView, setShowWebView] = useState(false)
   const [webViewReady, setWebViewReady] = useState(false)
   const [capturingSession, setCapturingSession] = useState(false)
@@ -56,7 +51,7 @@ export default function Profile() {
   }, [])
 
   useEffect(() => {
-    if (connect === '1') openInstacartConnect()
+    if (connect === '1') openWalmartConnect()
   }, [connect])
 
   async function loadProfile() {
@@ -76,8 +71,7 @@ export default function Profile() {
       setDietary(data.dietary ?? [])
       setAllergies(data.allergies ?? [])
       setBrands(data.brands ?? [])
-      setPreferredStore(data.preferred_store_slug ?? '')
-      setInstacartConnected(!!data.instacart_session)
+      setWalmartConnected(!!data.walmart_session)
     }
   }
 
@@ -112,7 +106,6 @@ export default function Profile() {
       dietary,
       allergies,
       brands,
-      preferred_store_slug: preferredStore,
     }
 
     if (profileId) {
@@ -126,7 +119,7 @@ export default function Profile() {
     Alert.alert('Saved', 'Your profile has been updated.')
   }
 
-  function openInstacartConnect() {
+  function openWalmartConnect() {
     capturedRef.current = false
     setWebViewReady(false)
     setCapturingSession(false)
@@ -135,13 +128,11 @@ export default function Profile() {
 
   function handleWebViewNavigation(navState: { url: string }) {
     const url = navState.url || ''
-    // User has left the login/oauth pages — they're logged in
+    // User has landed on a walmart.ca page that is not the login/sign-in page
     const isLoggedIn =
-      url.includes('instacart.ca') &&
+      url.includes('walmart.ca') &&
       !url.includes('/login') &&
-      !url.includes('accounts.google.com') &&
-      !url.includes('appleid.apple.com') &&
-      !url.includes('facebook.com')
+      !url.includes('/sign-in')
 
     if (isLoggedIn && webViewReady && !capturedRef.current) {
       capturedRef.current = true
@@ -152,8 +143,8 @@ export default function Profile() {
 
   async function handleWebViewMessage(event: { nativeEvent: { data: string } }) {
     try {
-      const data = JSON.parse(event.nativeEvent.data)
-      if (data.error) {
+      const parsed = JSON.parse(event.nativeEvent.data)
+      if (parsed.type !== 'session' || !parsed.data) {
         setCapturingSession(false)
         Alert.alert('Error', 'Could not capture session. Please try again.')
         return
@@ -162,39 +153,34 @@ export default function Profile() {
       const { data: { user } } = await supabase.auth.getUser()
       if (!user) return
 
-      const sessionJson = JSON.stringify({
-        cookies: data.cookies ?? '',
-        localStorage: data.localStorage ?? {},
-      })
-
-      const updatePayload = { instacart_session: sessionJson }
+      const updatePayload = { walmart_session: parsed.data }
       if (profileId) {
         await supabase.from('profiles').update(updatePayload).eq('id', profileId)
       } else {
         await supabase.from('profiles').upsert({ user_id: user.id, ...updatePayload })
       }
 
-      setInstacartConnected(true)
+      setWalmartConnected(true)
       setCapturingSession(false)
       setShowWebView(false)
-      Alert.alert('Connected!', 'Your Instacart account is now linked. The agent will use it for your next shopping run.')
+      Alert.alert('Connected!', 'Your Walmart account is now linked. The agent will use it for your next shopping run.')
     } catch {
       setCapturingSession(false)
       Alert.alert('Error', 'Failed to save session. Please try again.')
     }
   }
 
-  async function disconnectInstacart() {
-    Alert.alert('Disconnect Instacart', 'Remove your Instacart session?', [
+  async function disconnectWalmart() {
+    Alert.alert('Disconnect Walmart', 'Remove your Walmart session?', [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Disconnect',
         style: 'destructive',
         onPress: async () => {
           if (profileId) {
-            await supabase.from('profiles').update({ instacart_session: '' }).eq('id', profileId)
+            await supabase.from('profiles').update({ walmart_session: '' }).eq('id', profileId)
           }
-          setInstacartConnected(false)
+          setWalmartConnected(false)
         }
       }
     ])
@@ -309,43 +295,25 @@ export default function Profile() {
         </View>
 
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Preferred Store</Text>
-          <Text style={styles.cardSubtitle}>SGA will shop from this store on Instacart</Text>
-          <View style={styles.tagsWrap}>
-            {INSTACART_STORES.map(store => (
-              <TouchableOpacity
-                key={store.slug}
-                style={[styles.tag, preferredStore === store.slug && styles.tagActive]}
-                onPress={() => setPreferredStore(store.slug)}
-              >
-                <Text style={[styles.tagText, preferredStore === store.slug && styles.tagTextActive]}>
-                  {store.label}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-          {!preferredStore && (
-            <Text style={styles.secureNote}>Pick your store so the agent searches in the right place</Text>
-          )}
-        </View>
-
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Instacart Account</Text>
-          <Text style={styles.cardSubtitle}>Connect your account so the AI agent can shop on your behalf</Text>
-          {instacartConnected ? (
+          <Text style={styles.cardTitle}>Walmart Canada Account</Text>
+          <Text style={styles.cardSubtitle}>Connect your Walmart Canada account so SGA can add groceries to your cart automatically.</Text>
+          {walmartConnected ? (
             <View style={styles.connectedRow}>
               <View style={styles.connectedBadge}>
                 <View style={styles.connectedDot} />
-                <Text style={styles.connectedText}>Connected</Text>
+                <Text style={styles.connectedText}>✓ Walmart Connected</Text>
               </View>
-              <TouchableOpacity onPress={disconnectInstacart}>
-                <Text style={styles.disconnectText}>Disconnect</Text>
+              <TouchableOpacity onPress={disconnectWalmart}>
+                <Text style={styles.disconnectText}>Reconnect Walmart</Text>
               </TouchableOpacity>
             </View>
           ) : (
-            <TouchableOpacity style={styles.connectBtn} onPress={openInstacartConnect}>
-              <Text style={styles.connectBtnText}>Connect Instacart Account</Text>
-            </TouchableOpacity>
+            <>
+              <Text style={styles.secureNote}>Not connected</Text>
+              <TouchableOpacity style={styles.connectBtn} onPress={openWalmartConnect}>
+                <Text style={styles.connectBtnText}>Connect Walmart Account</Text>
+              </TouchableOpacity>
+            </>
           )}
           <Text style={styles.secureNote}>Your session is encrypted and only used by the shopping agent</Text>
         </View>
@@ -367,8 +335,8 @@ export default function Profile() {
         <SafeAreaView style={styles.modalContainer}>
           <View style={styles.modalHeader}>
             <View>
-              <Text style={styles.modalTitle}>Connect Instacart</Text>
-              <Text style={styles.modalSubtitle}>Log in with your Instacart account</Text>
+              <Text style={styles.modalTitle}>Connect Walmart</Text>
+              <Text style={styles.modalSubtitle}>Log in with your Walmart Canada account</Text>
             </View>
             <TouchableOpacity
               style={styles.modalCloseBtn}
@@ -387,7 +355,7 @@ export default function Profile() {
 
           <WebView
             ref={webViewRef}
-            source={{ uri: 'https://www.instacart.ca/login' }}
+            source={{ uri: 'https://www.walmart.ca' }}
             style={styles.webView}
             onLoad={() => setWebViewReady(true)}
             onNavigationStateChange={handleWebViewNavigation}

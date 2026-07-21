@@ -25,7 +25,7 @@ export type Cart = {
   status: 'pending' | 'reviewed' | 'checked_out'
   total: number
   platform: string
-  instacart_added: boolean
+  walmart_added: boolean
   items: CartItem[]
 }
 
@@ -40,7 +40,6 @@ export type CartItem = {
   store: string
   swapped: boolean
   quantity?: string
-  instacart_item_id?: string
 }
 
 export type UserProfile = {
@@ -50,7 +49,6 @@ export type UserProfile = {
   dietary: string[]
   allergies: string[]
   brands: string[]
-  instacart_email: string
-  instacart_password: string
+  walmart_session: string
   github_token?: string
 }

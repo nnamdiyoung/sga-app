@@ -64,6 +64,10 @@ create table if not exists cart_items (
 -- ALTER TABLE carts ADD COLUMN IF NOT EXISTS instacart_added BOOLEAN DEFAULT FALSE;
 -- ALTER TABLE profiles ADD COLUMN IF NOT EXISTS preferred_location_id TEXT DEFAULT '';
 
+-- Walmart migration:
+-- ALTER TABLE profiles ADD COLUMN IF NOT EXISTS walmart_session TEXT DEFAULT '';
+-- ALTER TABLE carts ADD COLUMN IF NOT EXISTS walmart_added BOOLEAN DEFAULT FALSE;
+
 -- Row Level Security
 alter table profiles enable row level security;
 alter table grocery_items enable row level security;
