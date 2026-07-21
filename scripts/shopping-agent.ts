@@ -476,11 +476,17 @@ Instructions:
 - If items weren't found, mention them briefly at the end with a 😅 or similar
 - End with a clear call to action: ${instacartAdded ? '"Your Instacart cart is loaded — just open Instacart and checkout! 🎉"' : '"Open SGA → Cart tab to add your items to Instacart"'}
 - Keep the whole thing under 200 words
-- Output only the HTML body content (no <html>/<body> tags), inline styles only`,
+- Output ONLY raw HTML — no markdown, no backticks, no code fences, no \`\`\`html wrapper
+- Start your response directly with the first HTML element`,
     }],
   });
 
-  return (msg.content[0] as Anthropic.TextBlock).text;
+  // Strip markdown code fences in case Claude wraps output despite instructions
+  return (msg.content[0] as Anthropic.TextBlock).text
+    .replace(/^```html\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
 }
 
 // ─── Session setup ────────────────────────────────────────────────────────────

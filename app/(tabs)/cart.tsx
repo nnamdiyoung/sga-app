@@ -126,6 +126,7 @@ export default function CartScreen() {
   const addedRef = useRef(0)
   const indexRef = useRef(0)
   const queueRef = useRef<CartItem[]>([])
+  const currentUrlRef = useRef('')
   const toastAnim = useRef(new Animated.Value(-80)).current
 
   useEffect(() => {
@@ -251,7 +252,14 @@ export default function CartScreen() {
     }
   }
 
+  function handleNavStateChange(navState: { url: string }) {
+    currentUrlRef.current = navState.url || ''
+  }
+
   function handleWebViewLoad() {
+    const url = currentUrlRef.current
+    // After adding, Instacart navigates the SPA to the cart page — don't inject there
+    if (url && !url.includes('/products/')) return
     const item = queueRef.current[indexRef.current]
     const qty = parseQty(item?.quantity)
     setTimeout(() => {
@@ -263,7 +271,8 @@ export default function CartScreen() {
   async function handleWebViewMessage(event: { nativeEvent: { data: string } }) {
     try {
       const data = JSON.parse(event.nativeEvent.data)
-      console.log('[SGA] WebView msg:', JSON.stringify(data))
+      // Ignore messages from non-product pages (cart, home, etc.)
+      if (data.url && !data.url.includes('/products/')) return
 
       const currentItem = queueRef.current[indexRef.current]
       if (data.image && currentItem) {
@@ -421,13 +430,15 @@ export default function CartScreen() {
       <Modal visible={showAddFlow} animationType="slide" presentationStyle="fullScreen">
         <SafeAreaView style={styles.modalContainer}>
 
-          {addStatus === 'adding' && currentItem?.product_url ? (<>
-            {/* WebView always running — hidden unless manual mode needed */}
+          {addStatus === 'adding' && currentItem?.product_url ? (
+            <View style={{ flex: 1 }}>
+            {/* WebView always takes full space and runs silently */}
             <WebView
               ref={webViewRef}
               source={{ uri: currentItem.product_url }}
-              style={needsManual ? styles.webviewVisible : styles.webviewHidden}
+              style={{ flex: 1 }}
               onLoad={handleWebViewLoad}
+              onNavigationStateChange={handleNavStateChange}
               onMessage={handleWebViewMessage}
               javaScriptEnabled
               domStorageEnabled
@@ -436,9 +447,9 @@ export default function CartScreen() {
               userAgent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
             />
 
-            {/* Animation overlay — shown while auto-adding */}
+            {/* Animation overlay covers WebView while auto-adding */}
             {!needsManual && (
-              <View style={styles.animScreen}>
+              <View style={[StyleSheet.absoluteFill, styles.animScreen]}>
                 <TouchableOpacity onPress={handleDone} style={styles.animClose}>
                   <Ionicons name="close" size={22} color={colors.textSecondary} />
                 </TouchableOpacity>
@@ -497,7 +508,8 @@ export default function CartScreen() {
                 </View>
               </View>
             )}
-          </>) : addStatus === 'done' ? (
+            </View>
+          ) : addStatus === 'done' ? (
             <View style={styles.doneContainer}>
               <Text style={styles.doneIcon}>
                 {addedCount === addQueue.length ? '✅' : '⚠️'}
@@ -646,10 +658,7 @@ const styles = StyleSheet.create({
   },
   toastText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
   modalContainer: { flex: 1, backgroundColor: colors.background },
-  webviewVisible: { flex: 1 },
-  webviewHidden: { position: 'absolute', top: 9999, left: 9999, width: 1, height: 1, opacity: 0 },
   animScreen: {
-    flex: 1,
     backgroundColor: colors.background,
     paddingHorizontal: spacing.lg,
     paddingTop: spacing.sm,
