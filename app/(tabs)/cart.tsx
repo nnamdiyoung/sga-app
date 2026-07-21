@@ -51,54 +51,83 @@ true;
 // ---------------------------------------------------------------------------
 // Build the JS that fires the UpdateCartItemsMutation for all items at once.
 // ---------------------------------------------------------------------------
-function makeAddJS(items: { savedItemId: string | null; productId: string | null; qty: number }[]): string {
+function makeAddJS(items: { productUrl: string; qty: number }[]): string {
   return `(function(items){
   var ctx=window.__ctx;var f=window.__f||window.fetch;
-  function go(){
-    // Derive cartId from the first item's lid (saved itemId encodes the correct location)
-    var firstItemId=items[0].savedItemId||('items_'+ctx.lid+'-'+items[0].productId);
-    var cartLid=firstItemId.split('-')[0].replace('items_','');
+
+  // Fetch each product page from this authenticated WebView and extract v4ItemId.
+  // This gives us the correct itemId for the user's actual store location,
+  // regardless of where the agent ran.
+  function fetchItemId(url,cb){
+    var path=url.replace(/^https?:\/\/[^/]+/,'');
+    f(path,{credentials:'include',headers:{Accept:'text/html'}})
+      .then(function(r){return r.text();})
+      .then(function(html){
+        var m=html.match(/"v4ItemId":"(items_[^"]+)"/);
+        cb(m?m[1]:null);
+      }).catch(function(){cb(null);});
+  }
+
+  function addToCart(itemIds){
+    var updates=itemIds.map(function(id,i){return{
+      itemId:id,
+      quantity:items[i].qty,quantityType:'each',
+      trackingParams:{attributionMetadata:{shopId:'',nestedShopId:''},trackingProperties:{}}
+    };});
     f('/graphql?operationName=UpdateCartItemsMutation',{
       method:'POST',
       headers:{'Content-Type':'application/json','x-client-identifier':'web'},
       credentials:'include',
       body:JSON.stringify({
         operationName:'UpdateCartItemsMutation',
-        variables:{
-          cartId:cartLid,
-          cartItemUpdates:items.map(function(i){return{
-            itemId:i.savedItemId||('items_'+ctx.lid+'-'+i.productId),
-            quantity:i.qty,quantityType:'each',
-            trackingParams:{attributionMetadata:{shopId:'',nestedShopId:''},trackingProperties:{}}
-          };}),
-          cartType:'grocery',requestTimestamp:Date.now()
-        },
+        variables:{cartId:ctx.lid,cartItemUpdates:updates,cartType:'grocery',requestTimestamp:Date.now()},
         extensions:{persistedQuery:{version:1,sha256Hash:'ba4bf465d294d1d528d82a4ac48ac13980d528149874c0e52082dc1d833bdb09'}}
       })
     }).then(function(r){return r.json();}).then(function(d){
       var c=d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.cart;
       var updatedIds=(d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.updatedItemIds)||[];
       var errMsg=d.errors?d.errors[0].message:null;
-      var debug='cartLid='+cartLid+' lid='+ctx.lid+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,200);
+      var debug='lid='+ctx.lid+' ids='+JSON.stringify(itemIds)+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,150);
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:!!c,count:c?c.itemCount:0,added:updatedIds.length,err:errMsg,debug:debug}));
     }).catch(function(e){
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:String(e),debug:'catch:'+String(e)}));
     });
   }
+
+  function resolveAll(){
+    var resolved=new Array(items.length).fill(null);
+    var pending=items.length;
+    items.forEach(function(item,i){
+      fetchItemId(item.productUrl,function(id){
+        resolved[i]=id;
+        pending--;
+        if(pending===0){
+          var valid=resolved.filter(Boolean);
+          if(!valid.length){
+            window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_items_resolved',debug:'lid='+ctx.lid+' urls='+JSON.stringify(items.map(function(x){return x.productUrl;}))}));
+            return;
+          }
+          // Only add items we successfully resolved
+          var validItems=items.filter(function(_,i){return !!resolved[i];});
+          addToCart(resolved.filter(Boolean));
+        }
+      });
+    });
+  }
+
   var n=0;
   function poll(){
-    if(!ctx.cid||!ctx.lid){
+    if(!ctx.lid){
       try{
         var nd=JSON.stringify(window.__NEXT_DATA__||{});
-        if(!ctx.cid){var m=nd.match(/"cartId":"([^"]+)"/);if(m)ctx.cid=m[1];}
         if(!ctx.lid){var m2=nd.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];}
         if(!ctx.lid){var m3=nd.match(/"v4ItemId":"items_([^-"]+)-/);if(m3)ctx.lid=m3[1];}
       }catch(e){}
     }
-    if(ctx.cid&&ctx.lid){go();return;}
+    if(ctx.lid){resolveAll();return;}
     n++;
     if(n<60)setTimeout(poll,500);
-    else window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:{cid:ctx.cid,lid:ctx.lid,url:window.location.href}}));
+    else window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:'url='+window.location.href}));
   }
   poll();
 })(${JSON.stringify(items)});
@@ -143,7 +172,7 @@ export default function CartScreen() {
 
   const router = useRouter()
   const instacartWebViewRef = useRef<WebViewType>(null)
-  const pendingItemsRef = useRef<{ productId: string; qty: number }[]>([])
+  const pendingItemsRef = useRef<{ productUrl: string; qty: number }[]>([])
   const toastAnim = useRef(new Animated.Value(-80)).current
 
   useEffect(() => {
@@ -260,20 +289,11 @@ export default function CartScreen() {
   // Instacart GraphQL flow
   // ---------------------------------------------------------------------------
   function startInstacartAdd(cartItems: CartItem[]) {
-    const ITEM_ID_RE = /^items_\d+-\d+$/
     const items = cartItems
       .filter(i => !!i.product_url && !i.product_name?.startsWith('Search for "'))
-      .map(i => {
-        // Prefer the full instacart_item_id saved by the agent (already has the correct lid+productId)
-        const savedItemId = i.instacart_item_id && ITEM_ID_RE.test(i.instacart_item_id)
-          ? i.instacart_item_id : null
-        const productId = savedItemId ? null : extractProductId(i.product_url)
-        if (!savedItemId && !productId) console.warn('[SGA] No itemId or productId for:', i.grocery_item_name)
-        return (savedItemId || productId) ? { savedItemId, productId, qty: parseQty(i.quantity) } : null
-      })
-      .filter((i): i is { savedItemId: string | null; productId: string | null; qty: number } => i !== null)
+      .map(i => ({ productUrl: i.product_url, qty: parseQty(i.quantity) }))
 
-    console.log(`[SGA] startInstacartAdd: ${items.length} of ${cartItems.length} items have valid productIds`)
+    console.log(`[SGA] startInstacartAdd: ${items.length} items with product URLs`)
 
     if (items.length === 0) return
 
