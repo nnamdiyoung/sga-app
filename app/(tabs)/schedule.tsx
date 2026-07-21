@@ -71,10 +71,6 @@ export default function Schedule() {
   }
 
   async function confirmShopNow() {
-    if (!selectedStore) {
-      Alert.alert('Pick a store', 'Select which store to shop from.')
-      return
-    }
     setShopping(true)
     setPickingStore(false)
     try {
@@ -93,7 +89,7 @@ export default function Schedule() {
         setShopping(false)
         return
       }
-      setRunningStoreName(storeLabel(selectedStore))
+      setRunningStoreName(selectedStore ? storeLabel(selectedStore) : 'best store')
       setAgentRunning(true)
       setCartReady(false)
       startWatchingForCart()
@@ -213,6 +209,14 @@ export default function Schedule() {
             <>
               <Text style={styles.shopNowTitle}>Where should SGA shop?</Text>
               <View style={styles.storeGrid}>
+                <TouchableOpacity
+                  style={[styles.storeBtn, selectedStore === '' && styles.storeBtnActive]}
+                  onPress={() => setSelectedStore('')}
+                >
+                  <Text style={[styles.storeBtnText, selectedStore === '' && styles.storeBtnTextActive]}>
+                    Let SGA decide
+                  </Text>
+                </TouchableOpacity>
                 {INSTACART_STORES.map(store => (
                   <TouchableOpacity
                     key={store.slug}
@@ -230,9 +234,9 @@ export default function Schedule() {
                   <Text style={styles.cancelBtnText}>Cancel</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
-                  style={[styles.shopNowBtn, { flex: 1 }, (!selectedStore || shopping) && styles.shopNowBtnDisabled]}
+                  style={[styles.shopNowBtn, { flex: 1 }, shopping && styles.shopNowBtnDisabled]}
                   onPress={confirmShopNow}
-                  disabled={!selectedStore || shopping}
+                  disabled={shopping}
                 >
                   <Text style={styles.shopNowBtnText}>{shopping ? 'Starting...' : 'Start Shopping'}</Text>
                 </TouchableOpacity>
