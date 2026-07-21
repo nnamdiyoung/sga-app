@@ -288,6 +288,7 @@ export default function CartScreen() {
       console.log('[SGA] Instacart API result:', JSON.stringify(data))
 
       if (data.debug) setInstacartDebug(JSON.stringify(data.debug))
+      else if (data.err) setInstacartDebug(data.err)
       if (data.ok) {
         setInstacartCount(data.added ?? data.count ?? pendingItemsRef.current.length)
         setInstacartPhase('done')
