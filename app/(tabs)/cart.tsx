@@ -76,13 +76,15 @@ true;
 // ---------------------------------------------------------------------------
 // Build the JS that fires the UpdateCartItemsMutation for all items at once.
 // itemId strategy:
-//   1. Search /store/{slug}/search_v3?q={name} from the WebView (user's location)
-//      and extract the first v4ItemId from the SSR HTML — correct for user's store
-//   2. Fall back to ctx.v4ids[productId] captured from page-load API calls
-//   3. Last resort: construct "items_" + ctx.lid + "-" + productId from URL
+//   1. For item[0]: read v4ItemId from the already-loaded search page's __NEXT_DATA__
+//      or ctx.v4ids captured by the intercept
+//   2. For all items: fetch the search page HTML (same-origin, cookies included) and
+//      scan for "v4ItemId":"items_..." — this gives location-correct IDs at the user's
+//      retailer location, same as what the Playwright agent intercepts
+//   3. Last resort: construct "items_" + ctx.lid + "-" + productId from stored URL
 // ---------------------------------------------------------------------------
-function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): string {
-  return `(function(items){
+function makeAddJS(items: { productUrl: string; qty: number; name: string }[], preferredSlug: string): string {
+  return `(function(items, preferredSlug){
   var ctx=window.__ctx;var f=window.__f||window.fetch;
 
   function getProductId(url){
@@ -90,23 +92,57 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
     return m?m[1]:null;
   }
 
-  // Use Next.js /_next/data route to fetch search results as JSON at the user's location.
-  function searchViaNextData(buildId,name,cb){
-    var done=false;
-    var timer=setTimeout(function(){if(!done){done=true;cb(null);}},8000);
-    var url='/_next/data/'+buildId+'/store/s.json?k='+encodeURIComponent(name);
-    f(url,{credentials:'include'})
-      .then(function(r){return r.json();})
-      .then(function(d){
-        if(done)return;done=true;clearTimeout(timer);
-        var str=JSON.stringify(d);
-        var m=str.match(/"v4ItemId":"(items_[^"]+)"/);
-        cb(m?m[1]:null);
-      })
-      .catch(function(){if(!done){done=true;clearTimeout(timer);cb(null);}});
+  // Extract first v4ItemId from any text blob (SSR HTML or JSON)
+  function extractV4Id(text){
+    var m=text.match(/"v4ItemId":"(items_[^"]+)"/);
+    if(m)return m[1];
+    // Also match bare items_NNN-NNN format in id/itemId fields
+    m=text.match(/"(?:itemId|item_id)":"(items_\\d+-\\d+)"/);
+    return m?m[1]:null;
   }
 
-  function addToCart(pairs){
+  // Fetch a search page HTML and extract the first v4ItemId at the user's location.
+  // Uses store-specific URL when slug is known (same path as the agent), else generic.
+  function searchForV4Id(name, productUrl, isFirst, cb){
+    var done=false;
+    var timer=setTimeout(function(){if(!done){done=true;cb(null);}},12000);
+
+    function doFetch(){
+      var slug=ctx.slug||preferredSlug||'';
+      var path=slug
+        ?'/store/'+slug+'/search_v3?k='+encodeURIComponent(name)
+        :'/store/s?k='+encodeURIComponent(name);
+      f(path,{credentials:'include'})
+        .then(function(r){return r.text();})
+        .then(function(html){
+          if(done)return;done=true;clearTimeout(timer);
+          // Update lid/slug from HTML if not yet captured
+          if(!ctx.lid){var m2=html.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];}
+          if(!ctx.slug){var ms=html.match(/"(?:storeSlug|retailerSlug|store_slug)":"([a-z][a-z0-9-]{2,50})"/);if(ms)ctx.slug=ms[1];}
+          cb(extractV4Id(html));
+        })
+        .catch(function(){if(!done){done=true;clearTimeout(timer);cb(null);}});
+    }
+
+    // For item[0] the search page is already loaded — try to read its data without a fetch
+    if(isFirst){
+      try{
+        // 1. ctx.v4ids keyed by productId (captured by intercept from API responses)
+        var pid=getProductId(productUrl||'');
+        if(pid&&ctx.v4ids[pid]){clearTimeout(timer);done=true;cb(ctx.v4ids[pid]);return;}
+        // 2. __NEXT_DATA__ script element (SSR-embedded JSON)
+        var el=document.getElementById('__NEXT_DATA__');
+        if(el){
+          var v4=extractV4Id(el.textContent||el.innerText||'');
+          if(v4){clearTimeout(timer);done=true;cb(v4);return;}
+        }
+      }catch(e){}
+    }
+
+    doFetch();
+  }
+
+  function addToCart(pairs,slug){
     var updates=pairs.map(function(p){return{
       itemId:p.id,
       quantity:p.qty,quantityType:'each',
@@ -126,43 +162,39 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
       var updatedIds=(d&&d.data&&d.data.updateCartItems&&d.data.updateCartItems.updatedItemIds)||[];
       var errMsg=d.errors?d.errors[0].message:null;
       var ids=pairs.map(function(p){return p.id;});
-      var debug='lid='+ctx.lid+' buildId='+buildId+' ids='+JSON.stringify(ids.slice(0,2))+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,250);
+      var debug='lid='+ctx.lid+' slug='+(ctx.slug||slug)+' ids='+JSON.stringify(ids.slice(0,2))+' err='+errMsg+' resp='+JSON.stringify(d).substring(0,250);
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:!!c,count:c?c.itemCount:0,added:updatedIds.length,err:errMsg,debug:debug}));
     }).catch(function(e){
       window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:String(e),debug:'catch:'+String(e)}));
     });
   }
 
-  var buildId='';
-
   function resolveAndAdd(){
     var results=new Array(items.length).fill(null);
     var pending=items.length;
+    if(pending===0){finalize(results);return;}
+    // Launch all searches in parallel
     items.forEach(function(item,i){
-      if(buildId){
-        searchViaNextData(buildId,item.name,function(v4id){
-          results[i]=v4id;
-          pending--;
-          if(pending===0)finalize(results);
-        });
-      } else {
+      searchForV4Id(item.name,item.productUrl,i===0,function(v4id){
+        results[i]=v4id;
         pending--;
         if(pending===0)finalize(results);
-      }
+      });
     });
   }
 
   function finalize(results){
+    var slug=ctx.slug||preferredSlug||'';
     var pairs=items.map(function(it,j){
       if(results[j])return{id:results[j],qty:it.qty};
       var pid=getProductId(it.productUrl);
       return pid?{id:'items_'+ctx.lid+'-'+pid,qty:it.qty}:null;
     }).filter(Boolean);
     if(!pairs.length){
-      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_pairs_found',debug:'lid='+ctx.lid+' buildId='+buildId}));
+      window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'no_pairs_found',debug:'lid='+ctx.lid+' slug='+slug}));
       return;
     }
-    addToCart(pairs);
+    addToCart(pairs,slug);
   }
 
   var n=0;
@@ -174,17 +206,16 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
     try{
       var nd=window.__NEXT_DATA__||{};
       if(!ctx.lid){var ndStr=JSON.stringify(nd);var m2=ndStr.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];}
-      if(!buildId&&nd.buildId)buildId=String(nd.buildId);
     }catch(e){}
     if(ctx.lid){resolveAndAdd();return;}
     n++;
     if(n<60){setTimeout(poll,500);return;}
-    var dbg='lid='+ctx.lid+' buildId='+buildId+' url='+window.location.href;
+    var dbg='lid='+ctx.lid+' slug='+(ctx.slug||preferredSlug)+' url='+window.location.href;
     if(ctx.lid){resolveAndAdd();}
     else{window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:dbg}));}
   }
   poll();
-})(${JSON.stringify(items)});
+})(${JSON.stringify(items)},${JSON.stringify(preferredSlug)});
 true;`
 }
 
@@ -227,6 +258,7 @@ export default function CartScreen() {
   const router = useRouter()
   const instacartWebViewRef = useRef<WebViewType>(null)
   const pendingItemsRef = useRef<{ productUrl: string; qty: number; name: string }[]>([])
+  const pendingSlugRef = useRef<string>('')
   const toastAnim = useRef(new Animated.Value(-80)).current
 
   useEffect(() => {
@@ -342,21 +374,31 @@ export default function CartScreen() {
   // ---------------------------------------------------------------------------
   // Instacart GraphQL flow
   // ---------------------------------------------------------------------------
-  function startInstacartAdd(cartItems: CartItem[]) {
+  async function startInstacartAdd(cartItems: CartItem[]) {
     const items = cartItems
       .filter(i => !!i.product_url && !i.product_name?.startsWith('Search for "'))
       .map(i => ({ productUrl: i.product_url, qty: parseQty(i.quantity), name: i.grocery_item_name }))
 
-    console.log(`[SGA] startInstacartAdd: ${items.length} items with product URLs`)
-
     if (items.length === 0) return
 
+    // Load preferred store slug so makeAddJS can use store-specific search URLs
+    // (same path as the Playwright agent, which successfully finds v4ItemIds)
+    let storeSlug = ''
+    const { data: { user } } = await supabase.auth.getUser()
+    if (user) {
+      const { data: profile } = await supabase.from('profiles').select('preferred_store_slug').eq('user_id', user.id).single()
+      storeSlug = profile?.preferred_store_slug ?? ''
+    }
+
     const firstItemName = items[0]?.name ?? ''
-    const storeUrl = firstItemName
-      ? `https://www.instacart.ca/store/s?k=${encodeURIComponent(firstItemName)}`
-      : 'https://www.instacart.ca'
+    const storeUrl = storeSlug
+      ? `https://www.instacart.ca/store/${storeSlug}/search_v3?k=${encodeURIComponent(firstItemName)}`
+      : firstItemName
+        ? `https://www.instacart.ca/store/s?k=${encodeURIComponent(firstItemName)}`
+        : 'https://www.instacart.ca'
 
     pendingItemsRef.current = items
+    pendingSlugRef.current = storeSlug
     setInstacartUrl(storeUrl)
     setWebViewKey(k => k + 1) // force fresh WebView mount
     setInstacartPhase('loading')
@@ -366,7 +408,7 @@ export default function CartScreen() {
 
   function handleInstacartLoad() {
     setInstacartPhase('adding')
-    instacartWebViewRef.current?.injectJavaScript(makeAddJS(pendingItemsRef.current))
+    instacartWebViewRef.current?.injectJavaScript(makeAddJS(pendingItemsRef.current, pendingSlugRef.current))
   }
 
   async function handleInstacartMessage(event: { nativeEvent: { data: string } }) {
