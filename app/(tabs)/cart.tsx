@@ -3,6 +3,7 @@ import {
   View, Text, TouchableOpacity, FlatList,
   StyleSheet, SafeAreaView, Image, Modal, ActivityIndicator, Linking, RefreshControl, Animated
 } from 'react-native'
+import { useRouter } from 'expo-router'
 import { Ionicons } from '@expo/vector-icons'
 import { WebView } from 'react-native-webview'
 import type { WebView as WebViewType } from 'react-native-webview'
@@ -117,7 +118,10 @@ export default function CartScreen() {
   const [instacartPhase, setInstacartPhase] = useState<'idle' | 'loading' | 'adding' | 'done' | 'error'>('idle')
   const [instacartCount, setInstacartCount] = useState(0)
   const [showInstacartFlow, setShowInstacartFlow] = useState(false)
+  const [webViewKey, setWebViewKey] = useState(0)
+  const [instacartUrl, setInstacartUrl] = useState('https://www.instacart.ca')
 
+  const router = useRouter()
   const instacartWebViewRef = useRef<WebViewType>(null)
   const pendingItemsRef = useRef<{ productId: string; qty: number }[]>([])
   const toastAnim = useRef(new Animated.Value(-80)).current
@@ -249,7 +253,16 @@ export default function CartScreen() {
 
     if (items.length === 0) return
 
+    // Use a store-specific URL so Instacart makes cart API calls immediately
+    const firstUrl = cartItems.find(i => i.product_url?.includes('/store/'))?.product_url ?? ''
+    const storeSlugMatch = firstUrl.match(/\/store\/([^/?#]+)/)
+    const storeUrl = storeSlugMatch
+      ? `https://www.instacart.ca/store/${storeSlugMatch[1]}`
+      : 'https://www.instacart.ca'
+
     pendingItemsRef.current = items
+    setInstacartUrl(storeUrl)
+    setWebViewKey(k => k + 1) // force fresh WebView mount
     setInstacartPhase('loading')
     setInstacartCount(0)
     setShowInstacartFlow(true)
@@ -424,8 +437,9 @@ export default function CartScreen() {
         <SafeAreaView style={styles.modalContainer}>
           {/* Background WebView — hidden behind overlay */}
           <WebView
+            key={webViewKey}
             ref={instacartWebViewRef}
-            source={{ uri: 'https://www.instacart.ca' }}
+            source={{ uri: instacartUrl }}
             style={{ flex: 1 }}
             injectedJavaScriptBeforeContentLoaded={INSTACART_INTERCEPT_JS}
             onLoad={handleInstacartLoad}
@@ -473,9 +487,18 @@ export default function CartScreen() {
               <View style={styles.instacartError}>
                 <Text style={styles.instacartEmoji}>⚠️</Text>
                 <Text style={styles.instacartTitle}>Could not connect to Instacart</Text>
-                <Text style={styles.instacartSub}>Your session may have expired. Reconnect in Profile.</Text>
-                <TouchableOpacity style={styles.openBtn} onPress={() => setShowInstacartFlow(false)}>
-                  <Text style={styles.openBtnText}>Close</Text>
+                <Text style={styles.instacartSub}>Your session may have expired. Reconnect your account in Profile and try again.</Text>
+                <TouchableOpacity
+                  style={styles.openBtn}
+                  onPress={() => {
+                    setShowInstacartFlow(false)
+                    router.push('/(tabs)/profile')
+                  }}
+                >
+                  <Text style={styles.openBtnText}>Go to Profile →</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.closeBtn} onPress={() => setShowInstacartFlow(false)}>
+                  <Text style={styles.closeBtnText}>Close</Text>
                 </TouchableOpacity>
               </View>
             )}
