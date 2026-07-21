@@ -12,45 +12,72 @@ import type { Cart, CartItem } from '../../lib/types'
 
 function parseQty(quantity?: string): number {
   if (!quantity) return 1
-  const n = parseInt(quantity.match(/\d+/)?.[0] ?? '1', 10)
-  return Math.max(1, isNaN(n) ? 1 : n)
+  const trimmed = quantity.trim()
+  // Only use >1 for plain integers — quantities like "500g", "2 cups", "1 lb" mean 1 unit of the product
+  if (/^\d+$/.test(trimmed)) {
+    const n = parseInt(trimmed, 10)
+    return Math.max(1, Math.min(n, 20))
+  }
+  return 1
 }
 
 function makeInjectJS(qty: number): string {
   return `(function() {
+  var clicked = false;
   var ogImg = '';
   var metaOg = document.querySelector('meta[property="og:image"]');
   if (metaOg) ogImg = metaOg.getAttribute('content') || '';
 
-  var clicked = false;
-  var allBtns = Array.from(document.querySelectorAll('button, [role="button"]'));
-  var btnTexts = allBtns.slice(0, 30).map(function(b) {
-    return (b.getAttribute('aria-label') || b.textContent || '').replace(/\\s+/g, ' ').trim().substring(0, 50);
-  });
+  function tryClick(el) {
+    try {
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      el.click();
+      return true;
+    } catch(e) { return false; }
+  }
 
-  var candidates = [
+  // 1. data-testid selectors
+  var testIds = [
     '[data-testid="add-item-to-cart-button"]',
     '[data-testid*="add_to_cart"]',
     '[data-testid*="add-to-cart"]',
+    '[data-testid="add-button"]',
+    '[data-testid="AddButton"]',
   ];
-  for (var i = 0; i < candidates.length; i++) {
-    var el = document.querySelector(candidates[i]);
-    if (el) { el.click(); clicked = true; break; }
+  for (var i = 0; i < testIds.length; i++) {
+    var el = document.querySelector(testIds[i]);
+    if (el) { tryClick(el); clicked = true; break; }
   }
 
+  // 2. Exact text / aria-label match
   if (!clicked) {
-    for (var j = 0; j < allBtns.length; j++) {
-      var btn = allBtns[j];
-      var lbl = (btn.getAttribute('aria-label') || '').toLowerCase();
-      var txt = (btn.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-      if (lbl.includes('add to cart') || lbl.includes('add item') ||
-          txt === 'add to cart' || txt === 'add item' || txt === 'add' ||
-          txt.startsWith('add to')) {
-        btn.click(); clicked = true; break;
+    var phrases = ['add to cart', 'add item', 'add to bag'];
+    var btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+    for (var j = 0; j < btns.length; j++) {
+      var b = btns[j];
+      var txt = (b.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      var aria = (b.getAttribute('aria-label') || '').toLowerCase();
+      for (var k = 0; k < phrases.length; k++) {
+        if (txt === phrases[k] || aria === phrases[k] || aria.includes('add to cart')) {
+          tryClick(b); clicked = true; break;
+        }
+      }
+      if (clicked) break;
+    }
+  }
+
+  // 3. Loose fallback — button text starts with "Add" and is short
+  if (!clicked) {
+    var allBtns = Array.from(document.querySelectorAll('button'));
+    for (var m = 0; m < allBtns.length; m++) {
+      var t = (allBtns[m].textContent || '').trim().toLowerCase();
+      if (t.startsWith('add') && t.length <= 15 && !t.includes('wishlist') && !t.includes('note') && !t.includes('list')) {
+        tryClick(allBtns[m]); clicked = true; break;
       }
     }
   }
 
+  // Quantity increment
   var targetQty = ${qty};
   if (clicked && targetQty > 1) {
     var done = 0;
@@ -62,20 +89,21 @@ function makeInjectJS(qty: number): string {
       );
       if (!incEl) {
         var bs = Array.from(document.querySelectorAll('button'));
-        for (var k = 0; k < bs.length; k++) {
-          if ((bs[k].textContent || '').trim() === '+') { incEl = bs[k]; break; }
+        for (var n = 0; n < bs.length; n++) {
+          if ((bs[n].textContent || '').trim() === '+') { incEl = bs[n]; break; }
         }
       }
-      if (incEl) { incEl.click(); done++; }
-      if (done < needed) setTimeout(inc, 700);
+      if (incEl) { tryClick(incEl); done++; }
+      if (done < needed) setTimeout(inc, 600);
     }
     setTimeout(inc, 1500);
   }
 
-  window.ReactNativeWebView.postMessage(JSON.stringify({
-    clicked: clicked, image: ogImg, url: window.location.href,
-    title: document.title, btnTexts: btnTexts
-  }));
+  setTimeout(function() {
+    window.ReactNativeWebView.postMessage(JSON.stringify({
+      clicked: clicked, image: ogImg, url: window.location.href,
+    }));
+  }, clicked ? 2000 : 400);
 })();
 true;`
 }
@@ -92,13 +120,12 @@ export default function CartScreen() {
   const [addedCount, setAddedCount] = useState(0)
   const [isPageLoading, setIsPageLoading] = useState(false)
   const [needsManual, setNeedsManual] = useState(false)
-  const [showFlash, setShowFlash] = useState(false)
+  const [completedItemIds, setCompletedItemIds] = useState<string[]>([])
 
   const webViewRef = useRef<WebViewType>(null)
   const addedRef = useRef(0)
   const indexRef = useRef(0)
   const queueRef = useRef<CartItem[]>([])
-  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const toastAnim = useRef(new Animated.Value(-80)).current
 
   useEffect(() => {
@@ -206,17 +233,13 @@ export default function CartScreen() {
     setAddQueue(instacartItems)
     setAddIndex(0)
     setNeedsManual(false)
+    setCompletedItemIds([])
     setIsPageLoading(true)
     setAddStatus('adding')
     setShowAddFlow(true)
   }
 
   function advanceToNext() {
-    if (flashTimerRef.current) {
-      clearTimeout(flashTimerRef.current)
-      flashTimerRef.current = null
-    }
-    setShowFlash(false)
     const nextIndex = indexRef.current + 1
     indexRef.current = nextIndex
     if (nextIndex < queueRef.current.length) {
@@ -263,11 +286,10 @@ export default function CartScreen() {
       if (data.clicked) {
         addedRef.current += 1
         setAddedCount(addedRef.current)
-        setShowFlash(true)
-        flashTimerRef.current = setTimeout(() => {
-          setShowFlash(false)
-          advanceToNext()
-        }, 1500)
+        if (currentItem) {
+          setCompletedItemIds(prev => [...prev, currentItem.id])
+        }
+        setTimeout(advanceToNext, 600)
       } else {
         setNeedsManual(true)
       }
@@ -275,16 +297,12 @@ export default function CartScreen() {
   }
 
   function handleDone() {
-    if (flashTimerRef.current) {
-      clearTimeout(flashTimerRef.current)
-      flashTimerRef.current = null
-    }
     setShowAddFlow(false)
     setAddStatus('idle')
     setAddIndex(0)
     setAddQueue([])
     setNeedsManual(false)
-    setShowFlash(false)
+    setCompletedItemIds([])
     setIsPageLoading(false)
     indexRef.current = 0
     queueRef.current = []
@@ -403,79 +421,83 @@ export default function CartScreen() {
       <Modal visible={showAddFlow} animationType="slide" presentationStyle="fullScreen">
         <SafeAreaView style={styles.modalContainer}>
 
-          {/* Top banner */}
-          <View style={styles.addHeader}>
-            {addStatus === 'adding' ? (
-              <View style={styles.addHeaderContent}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.addHeaderTitle} numberOfLines={1}>
-                    {currentItem?.grocery_item_name}
-                  </Text>
-                  <Text style={styles.addHeaderSub}>
-                    {isPageLoading ? 'Loading product page...' : needsManual ? 'Tap "Add to cart" on the page below' : 'Adding to cart...'}
-                    {'  '}{addIndex + 1}/{addQueue.length}
+          {addStatus === 'adding' && currentItem?.product_url ? (<>
+            {/* WebView always running — hidden unless manual mode needed */}
+            <WebView
+              ref={webViewRef}
+              source={{ uri: currentItem.product_url }}
+              style={needsManual ? styles.webviewVisible : styles.webviewHidden}
+              onLoad={handleWebViewLoad}
+              onMessage={handleWebViewMessage}
+              javaScriptEnabled
+              domStorageEnabled
+              sharedCookiesEnabled
+              thirdPartyCookiesEnabled
+              userAgent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+            />
+
+            {/* Animation overlay — shown while auto-adding */}
+            {!needsManual && (
+              <View style={styles.animScreen}>
+                <TouchableOpacity onPress={handleDone} style={styles.animClose}>
+                  <Ionicons name="close" size={22} color={colors.textSecondary} />
+                </TouchableOpacity>
+
+                <View style={styles.animTop}>
+                  <Text style={styles.animCartEmoji}>🛒</Text>
+                  <Text style={styles.animTitle}>Adding to your cart</Text>
+                  <Text style={styles.animSub}>
+                    {isPageLoading ? 'Loading...' : `${addedCount} of ${addQueue.length} done`}
                   </Text>
                 </View>
-                {isPageLoading && <ActivityIndicator size="small" color={colors.primary} style={{ marginLeft: spacing.sm }} />}
-                <TouchableOpacity onPress={handleDone} style={styles.closeX}>
-                  <Text style={styles.closeXText}>✕</Text>
-                </TouchableOpacity>
-              </View>
-            ) : (
-              <View style={styles.addHeaderContent}>
-                <Text style={styles.addHeaderTitle}>
-                  {addedCount === addQueue.length ? '✅' : '⚠️'} {addedCount} of {addQueue.length} items added
-                </Text>
-                <TouchableOpacity onPress={handleDone} style={styles.closeX}>
-                  <Text style={styles.closeXText}>✕</Text>
-                </TouchableOpacity>
+
+                <View style={styles.animProgressTrack}>
+                  <View style={[styles.animProgressFill, {
+                    width: `${Math.round((addedCount / Math.max(addQueue.length, 1)) * 100)}%`
+                  }]} />
+                </View>
+
+                <View style={styles.animList}>
+                  {addQueue.map((item, idx) => {
+                    const done = completedItemIds.includes(item.id)
+                    const active = idx === addIndex && !done
+                    return (
+                      <View key={item.id} style={styles.animRow}>
+                        <Text style={[styles.animRowIcon, done && styles.animRowIconDone, active && styles.animRowIconActive]}>
+                          {done ? '✓' : active ? '·' : '·'}
+                        </Text>
+                        <Text style={[styles.animRowName, done && styles.animRowNameDone, active && styles.animRowNameActive]}>
+                          {item.grocery_item_name}
+                        </Text>
+                        {active && <ActivityIndicator size="small" color={colors.primary} style={{ marginLeft: 'auto' }} />}
+                      </View>
+                    )
+                  })}
+                </View>
               </View>
             )}
-          </View>
 
-          {addStatus === 'adding' && currentItem?.product_url ? (
-            <View style={{ flex: 1 }}>
-              <WebView
-                ref={webViewRef}
-                source={{ uri: currentItem.product_url }}
-                style={{ flex: 1 }}
-                onLoad={handleWebViewLoad}
-                onMessage={handleWebViewMessage}
-                javaScriptEnabled
-                domStorageEnabled
-                sharedCookiesEnabled
-                thirdPartyCookiesEnabled
-                userAgent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-              />
-
-              {/* "Added!" flash — brief overlay after successful auto-click */}
-              {showFlash && (
-                <View style={styles.flashOverlay}>
-                  <Text style={styles.flashIcon}>✓</Text>
-                  <Text style={styles.flashText}>Added!</Text>
+            {/* Manual bar — only shown when auto-click failed */}
+            {needsManual && (
+              <View style={styles.manualBar}>
+                <Text style={styles.manualText}>Tap "Add to cart" above, then:</Text>
+                <View style={styles.manualActions}>
+                  <TouchableOpacity style={styles.skipBtn} onPress={advanceToNext}>
+                    <Text style={styles.skipBtnText}>Skip</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.nextBtn} onPress={() => {
+                    const item = queueRef.current[indexRef.current]
+                    if (item) setCompletedItemIds(prev => [...prev, item.id])
+                    addedRef.current += 1
+                    setAddedCount(addedRef.current)
+                    advanceToNext()
+                  }}>
+                    <Text style={styles.nextBtnText}>Added — Next →</Text>
+                  </TouchableOpacity>
                 </View>
-              )}
-
-              {/* Manual bottom bar — only shows when auto-click failed */}
-              {needsManual && !showFlash && (
-                <View style={styles.manualBar}>
-                  <Text style={styles.manualText}>Tap "Add to cart" above, then:</Text>
-                  <View style={styles.manualActions}>
-                    <TouchableOpacity style={styles.skipBtn} onPress={advanceToNext}>
-                      <Text style={styles.skipBtnText}>Skip</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity style={styles.nextBtn} onPress={() => {
-                      addedRef.current += 1
-                      setAddedCount(addedRef.current)
-                      advanceToNext()
-                    }}>
-                      <Text style={styles.nextBtnText}>Added — Next →</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              )}
-            </View>
-          ) : addStatus === 'done' ? (
+              </View>
+            )}
+          </>) : addStatus === 'done' ? (
             <View style={styles.doneContainer}>
               <Text style={styles.doneIcon}>
                 {addedCount === addQueue.length ? '✅' : '⚠️'}
@@ -624,53 +646,76 @@ const styles = StyleSheet.create({
   },
   toastText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
   modalContainer: { flex: 1, backgroundColor: colors.background },
-  addHeader: {
-    backgroundColor: colors.card,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
+  webviewVisible: { flex: 1 },
+  webviewHidden: { position: 'absolute', top: 9999, left: 9999, width: 1, height: 1, opacity: 0 },
+  animScreen: {
+    flex: 1,
+    backgroundColor: colors.background,
     paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.md,
+    paddingTop: spacing.sm,
   },
-  addHeaderContent: {
+  animClose: {
+    alignSelf: 'flex-end',
+    padding: spacing.sm,
+  },
+  animTop: {
+    alignItems: 'center',
+    paddingTop: spacing.xl,
+    paddingBottom: spacing.lg,
+    gap: spacing.sm,
+  },
+  animCartEmoji: { fontSize: 52 },
+  animTitle: {
+    fontSize: font.size.xl,
+    fontWeight: '800',
+    color: colors.textPrimary,
+    letterSpacing: -0.3,
+  },
+  animSub: {
+    fontSize: font.size.sm,
+    color: colors.textSecondary,
+    fontWeight: '500',
+  },
+  animProgressTrack: {
+    height: 6,
+    backgroundColor: colors.border,
+    borderRadius: 3,
+    marginBottom: spacing.lg,
+    overflow: 'hidden',
+  },
+  animProgressFill: {
+    height: 6,
+    backgroundColor: colors.primary,
+    borderRadius: 3,
+  },
+  animList: {
+    gap: spacing.sm,
+  },
+  animRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: spacing.sm,
+    gap: spacing.md,
+    paddingVertical: 6,
   },
-  addHeaderTitle: {
-    fontSize: font.size.md,
+  animRowIcon: {
+    fontSize: 16,
+    width: 20,
+    color: colors.textMuted,
     fontWeight: '700',
+  },
+  animRowIconDone: { color: colors.primary },
+  animRowIconActive: { color: colors.primary },
+  animRowName: {
+    fontSize: font.size.md,
+    color: colors.textMuted,
+  },
+  animRowNameDone: {
+    color: colors.textSecondary,
+    textDecorationLine: 'line-through',
+  },
+  animRowNameActive: {
     color: colors.textPrimary,
-  },
-  addHeaderSub: {
-    fontSize: font.size.xs,
-    color: colors.textSecondary,
-    marginTop: 2,
-  },
-  closeX: {
-    padding: spacing.sm,
-    marginLeft: spacing.sm,
-  },
-  closeXText: {
-    fontSize: font.size.md,
-    color: colors.textSecondary,
-    fontWeight: '700',
-  },
-  flashOverlay: {
-    position: 'absolute',
-    top: 0, left: 0, right: 0, bottom: 0,
-    backgroundColor: 'rgba(0, 150, 0, 0.85)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: spacing.sm,
-  },
-  flashIcon: {
-    fontSize: 64,
-    color: '#fff',
-  },
-  flashText: {
-    fontSize: font.size.xxl,
-    fontWeight: '800',
-    color: '#fff',
+    fontWeight: '600',
   },
   manualBar: {
     backgroundColor: colors.card,

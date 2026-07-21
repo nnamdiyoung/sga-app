@@ -449,12 +449,34 @@ async function generateEmailSummary(
       : "Items were not automatically added to Instacart (session may have expired).",
   ].filter(Boolean).join(" ");
 
+  const itemLines = found.map(p =>
+    `- ${p.grocery_item_name}: ${p.product_name} — $${p.price.toFixed(2)} at ${p.store}`
+  ).join("\n");
+  const notFoundLines = notFound.length > 0
+    ? notFound.map(p => `- ${p.grocery_item_name}`).join("\n")
+    : "";
+
   const msg = await anthropic.messages.create({
     model: "claude-haiku-4-5-20251001",
-    max_tokens: 250,
+    max_tokens: 600,
     messages: [{
       role: "user",
-      content: `Write a short, friendly 3-4 sentence email body for a grocery shopping app. Be warm but concise — no bullet lists, no HTML, just sentences. Here's what happened:\n\n${context}\n\n${instacartAdded ? "Tell them their Instacart cart is pre-loaded and they just need to open Instacart and check out." : "Tell them to open the SGA app → Cart tab to review and add items to Instacart."}`,
+      content: `Write a fun, warm, slightly playful HTML email body for a smart grocery shopping app called SGA. Personality: like a helpful friend who just did your shopping for you.
+
+Shopping results:
+${context}
+
+Items found:
+${itemLines}
+${notFoundLines ? `\nNot found:\n${notFoundLines}` : ""}
+
+Instructions:
+- Start with a short punchy line (1 sentence) — make it fun, not corporate
+- Then show the item list as HTML: each item on its own line with a relevant food emoji at the start, the product name, and price. Use <ul> with no bullets (list-style:none), each <li> styled with padding.
+- If items weren't found, mention them briefly at the end with a 😅 or similar
+- End with a clear call to action: ${instacartAdded ? '"Your Instacart cart is loaded — just open Instacart and checkout! 🎉"' : '"Open SGA → Cart tab to add your items to Instacart"'}
+- Keep the whole thing under 200 words
+- Output only the HTML body content (no <html>/<body> tags), inline styles only`,
     }],
   });
 
