@@ -5,7 +5,6 @@ import {
 } from 'react-native'
 import { supabase } from '../../lib/supabase'
 import { colors, spacing, radius, font } from '../../lib/theme'
-import { INSTACART_STORES, storeLabel } from '../../lib/stores'
 import { useFocusEffect } from '@react-navigation/native'
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
@@ -27,11 +26,9 @@ export default function Schedule() {
   const [shopping, setShopping] = useState(false)
   const [agentRunning, setAgentRunning] = useState(false)
   const [cartReady, setCartReady] = useState(false)
-  const [pickingStore, setPickingStore] = useState(false)
-  const [selectedStore, setSelectedStore] = useState('')
-  const [runningStoreName, setRunningStoreName] = useState('')
   const agentRunningRef = useRef(false)
   const cartChannelRef = useRef<any>(null)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(() => {
     agentRunningRef.current = agentRunning
@@ -42,16 +39,16 @@ export default function Schedule() {
   }, [])
 
   useFocusEffect(useCallback(() => {
-    // Re-check DB if spinner was stuck when user comes back to tab
     if (agentRunningRef.current) {
       startWatchingForCart()
     }
     return () => {
       if (!agentRunningRef.current) {
         setCartReady(false)
-        setPickingStore(false)
-        setSelectedStore('')
-        setRunningStoreName('')
+      }
+      if (pollRef.current) {
+        clearInterval(pollRef.current)
+        pollRef.current = null
       }
     }
   }, []))
@@ -70,61 +67,63 @@ export default function Schedule() {
     }
   }
 
-  async function confirmShopNow() {
+  async function shopNow() {
     setShopping(true)
-    setPickingStore(false)
     try {
       const { data, error } = await supabase.functions.invoke('trigger-shopping-agent', {
-        body: { store_slug: selectedStore },
+        body: {},
       })
-      if (error) {
-        Alert.alert('Error', error.message ?? 'Could not start shopping.')
-        setPickingStore(true)
+      if (error || !data?.success) {
+        Alert.alert('Error', error?.message ?? data?.error ?? 'Could not start shopping.')
         setShopping(false)
         return
       }
-      if (!data?.success) {
-        Alert.alert('Error', data?.error ?? 'Could not start shopping.')
-        setPickingStore(true)
-        setShopping(false)
-        return
-      }
-      setRunningStoreName(selectedStore ? storeLabel(selectedStore) : 'best store')
       setAgentRunning(true)
       setCartReady(false)
       startWatchingForCart()
     } catch (e: any) {
       Alert.alert('Error', e?.message ?? 'Could not start shopping.')
-      setPickingStore(true)
     }
     setShopping(false)
   }
 
   function startWatchingForCart() {
-    // Remove any existing channel to avoid duplicate error
     if (cartChannelRef.current) {
       supabase.removeChannel(cartChannelRef.current)
       cartChannelRef.current = null
+    }
+    if (pollRef.current) {
+      clearInterval(pollRef.current)
+      pollRef.current = null
     }
 
     supabase.auth.getUser().then(async ({ data: { user } }) => {
       if (!user) return
 
-      // Check if a cart with actual items exists (agent may have finished before subscription started)
-      const { data: existing } = await supabase
-        .from('carts')
-        .select('id, cart_items(id)')
-        .eq('user_id', user.id)
-        .eq('status', 'pending')
-        .limit(1)
-        .maybeSingle()
-
-      if (existing && (existing as any).cart_items?.length > 0) {
-        setAgentRunning(false)
-        setCartReady(true)
-        return
+      async function checkPendingCart() {
+        const { data } = await supabase
+          .from('carts')
+          .select('id')
+          .eq('user_id', user!.id)
+          .eq('status', 'pending')
+          .limit(1)
+          .maybeSingle()
+        if (data) {
+          setAgentRunning(false)
+          setCartReady(true)
+          if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+          if (cartChannelRef.current) { supabase.removeChannel(cartChannelRef.current); cartChannelRef.current = null }
+        }
       }
 
+      // Immediate check — catches agent that finished before subscription was ready
+      await checkPendingCart()
+      if (!agentRunningRef.current) return
+
+      // Poll every 15s as primary signal (realtime can miss events)
+      pollRef.current = setInterval(checkPendingCart, 15000)
+
+      // Realtime as extra fast-path (fires immediately if connection is alive)
       const channel = supabase
         .channel('schedule-cart-watch')
         .on('postgres_changes', {
@@ -132,12 +131,7 @@ export default function Schedule() {
           schema: 'public',
           table: 'carts',
         }, (payload) => {
-          if (payload.new.user_id === user.id) {
-            setAgentRunning(false)
-            setCartReady(true)
-            supabase.removeChannel(channel)
-            cartChannelRef.current = null
-          }
+          if (payload.new.user_id === user.id) checkPendingCart()
         })
         .subscribe()
       cartChannelRef.current = channel
@@ -195,61 +189,28 @@ export default function Schedule() {
           {cartReady ? (
             <>
               <Text style={styles.shopNowTitle}>✅ Cart is ready!</Text>
-              <Text style={styles.shopNowSub}>Go to the Cart tab to review and add to Instacart</Text>
+              <Text style={styles.shopNowSub}>Go to the Cart tab to review your Walmart cart</Text>
             </>
           ) : agentRunning ? (
             <View style={styles.shopNowRow}>
               <View style={{ flex: 1 }}>
-                <Text style={styles.shopNowTitle}>⏳ Shopping at {runningStoreName}...</Text>
+                <Text style={styles.shopNowTitle}>⏳ Shopping on Walmart...</Text>
                 <Text style={styles.shopNowSub}>Finding best products (~2 min)</Text>
               </View>
               <ActivityIndicator color={colors.primary} />
             </View>
-          ) : pickingStore ? (
-            <>
-              <Text style={styles.shopNowTitle}>Where should SGA shop?</Text>
-              <View style={styles.storeGrid}>
-                <TouchableOpacity
-                  style={[styles.storeBtn, selectedStore === '' && styles.storeBtnActive]}
-                  onPress={() => setSelectedStore('')}
-                >
-                  <Text style={[styles.storeBtnText, selectedStore === '' && styles.storeBtnTextActive]}>
-                    Let SGA decide
-                  </Text>
-                </TouchableOpacity>
-                {INSTACART_STORES.map(store => (
-                  <TouchableOpacity
-                    key={store.slug}
-                    style={[styles.storeBtn, selectedStore === store.slug && styles.storeBtnActive]}
-                    onPress={() => setSelectedStore(store.slug)}
-                  >
-                    <Text style={[styles.storeBtnText, selectedStore === store.slug && styles.storeBtnTextActive]}>
-                      {store.label}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-              <View style={styles.shopNowRow}>
-                <TouchableOpacity style={styles.cancelBtn} onPress={() => setPickingStore(false)}>
-                  <Text style={styles.cancelBtnText}>Cancel</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.shopNowBtn, { flex: 1 }, shopping && styles.shopNowBtnDisabled]}
-                  onPress={confirmShopNow}
-                  disabled={shopping}
-                >
-                  <Text style={styles.shopNowBtnText}>{shopping ? 'Starting...' : 'Start Shopping'}</Text>
-                </TouchableOpacity>
-              </View>
-            </>
           ) : (
             <View style={styles.shopNowRow}>
               <View style={{ flex: 1 }}>
                 <Text style={styles.shopNowTitle}>Shop Now</Text>
-                <Text style={styles.shopNowSub}>Run SGA immediately, skipping the schedule</Text>
+                <Text style={styles.shopNowSub}>Run SGA immediately on Walmart Canada</Text>
               </View>
-              <TouchableOpacity style={styles.shopNowBtn} onPress={() => setPickingStore(true)}>
-                <Text style={styles.shopNowBtnText}>Shop Now</Text>
+              <TouchableOpacity
+                style={[styles.shopNowBtn, shopping && styles.shopNowBtnDisabled]}
+                onPress={shopNow}
+                disabled={shopping}
+              >
+                <Text style={styles.shopNowBtnText}>{shopping ? 'Starting...' : 'Shop Now'}</Text>
               </TouchableOpacity>
             </View>
           )}
@@ -431,24 +392,4 @@ const styles = StyleSheet.create({
   },
   shopNowBtnDisabled: { opacity: 0.5 },
   shopNowBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.sm },
-  storeGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
-  storeBtn: {
-    paddingHorizontal: spacing.md,
-    paddingVertical: 8,
-    borderRadius: radius.full,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.background,
-  },
-  storeBtnActive: { backgroundColor: colors.primary, borderColor: colors.primary },
-  storeBtnText: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '500' },
-  storeBtnTextActive: { color: '#fff', fontWeight: '700' },
-  cancelBtn: {
-    paddingVertical: 10,
-    paddingHorizontal: spacing.md,
-    borderRadius: radius.md,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  cancelBtnText: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '600' },
 })

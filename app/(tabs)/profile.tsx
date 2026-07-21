@@ -41,7 +41,6 @@ export default function Profile() {
   const [email, setEmail] = useState('')
   const [walmartConnected, setWalmartConnected] = useState(false)
   const [showWebView, setShowWebView] = useState(false)
-  const [webViewReady, setWebViewReady] = useState(false)
   const [capturingSession, setCapturingSession] = useState(false)
   const webViewRef = useRef<WebViewType>(null)
   const capturedRef = useRef(false)
@@ -121,24 +120,15 @@ export default function Profile() {
 
   function openWalmartConnect() {
     capturedRef.current = false
-    setWebViewReady(false)
     setCapturingSession(false)
     setShowWebView(true)
   }
 
-  function handleWebViewNavigation(navState: { url: string }) {
-    const url = navState.url || ''
-    // User has landed on a walmart.ca page that is not the login/sign-in page
-    const isLoggedIn =
-      url.includes('walmart.ca') &&
-      !url.includes('/login') &&
-      !url.includes('/sign-in')
-
-    if (isLoggedIn && webViewReady && !capturedRef.current) {
-      capturedRef.current = true
-      setCapturingSession(true)
-      webViewRef.current?.injectJavaScript(CAPTURE_SESSION_JS)
-    }
+  function handleSignedIn() {
+    if (capturedRef.current) return
+    capturedRef.current = true
+    setCapturingSession(true)
+    webViewRef.current?.injectJavaScript(CAPTURE_SESSION_JS)
   }
 
   async function handleWebViewMessage(event: { nativeEvent: { data: string } }) {
@@ -355,10 +345,8 @@ export default function Profile() {
 
           <WebView
             ref={webViewRef}
-            source={{ uri: 'https://www.walmart.ca' }}
+            source={{ uri: 'https://www.walmart.ca/account/login' }}
             style={styles.webView}
-            onLoad={() => setWebViewReady(true)}
-            onNavigationStateChange={handleWebViewNavigation}
             onMessage={handleWebViewMessage}
             javaScriptEnabled
             domStorageEnabled
@@ -366,6 +354,18 @@ export default function Profile() {
             thirdPartyCookiesEnabled
             userAgent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
           />
+
+          <View style={styles.modalFooter}>
+            <TouchableOpacity
+              style={styles.signedInBtn}
+              onPress={handleSignedIn}
+              disabled={capturingSession}
+            >
+              <Text style={styles.signedInBtnText}>
+                {capturingSession ? 'Saving...' : "I'm Signed In →"}
+              </Text>
+            </TouchableOpacity>
+          </View>
         </SafeAreaView>
       </Modal>
     </SafeAreaView>
@@ -500,6 +500,20 @@ const styles = StyleSheet.create({
   },
   modalCloseBtnText: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '600' },
   webView: { flex: 1 },
+  modalFooter: {
+    padding: spacing.md,
+    paddingBottom: spacing.xl,
+    backgroundColor: colors.card,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+  },
+  signedInBtn: {
+    backgroundColor: colors.primary,
+    borderRadius: radius.md,
+    paddingVertical: 16,
+    alignItems: 'center',
+  },
+  signedInBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
   capturingOverlay: {
     position: 'absolute',
     top: 80,

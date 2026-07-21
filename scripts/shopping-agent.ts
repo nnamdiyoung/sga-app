@@ -89,94 +89,107 @@ async function saveScreenshot(page: Page, label: string): Promise<void> {
   } catch { /* non-fatal */ }
 }
 
-// ─── Walmart search (intercepts API responses) ────────────────────────────────
-
-async function searchWalmart(
-  page: Page,
-  query: string
-): Promise<SearchResult[]> {
-  const results: SearchResult[] = [];
-
-  function extractPrice(p: any): number {
-    const candidates = [
-      p.price, p.salePrice, p.currentPrice,
-      p.priceInfo?.currentPrice?.price,
-      p.priceInfo?.wasPrice?.price,
-      p.pricing?.price, p.pricing?.unit_price, p.pricing?.unitPrice,
-      p.pricing?.display_price, p.pricing?.displayPrice, p.pricing?.displayString,
-      p.pricing?.display_string, p.attributes?.price,
-      p.displayPrice, p.display_price, p.priceString, p.price_string,
-    ];
-    for (const v of candidates) {
-      if (v == null) continue;
-      const n = parseFloat(String(v).replace(/[^0-9.]/g, ""));
-      if (!isNaN(n) && n > 0) return n;
-    }
-    return 0;
+async function solvePressAndHold(page: Page, buttonText: string): Promise<void> {
+  try {
+    const btn = page.getByText(buttonText, { exact: false }).first();
+    const box = await btn.boundingBox();
+    if (!box) { await btn.click({ force: true }).catch(() => {}); return; }
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 10 });
+    await page.waitForTimeout(300);
+    await page.mouse.down();
+    await page.waitForTimeout(3500);
+    await page.mouse.up();
+    await page.waitForTimeout(3000);
+  } catch (e) {
+    console.log(`[CAPTCHA] Hold error: ${e}`);
   }
+}
 
-  const handler = async (response: any) => {
-    const url: string = response.url();
-    if (!url.includes("walmart")) return;
-    if (!(response.headers()["content-type"] ?? "").includes("application/json")) return;
-    try {
-      const json = await response.json();
-      const candidates: any[] =
-        json?.items ??
-        json?.products ??
-        json?.payload?.products ??
-        json?.searchContent?.products ??
-        json?.results ??
-        json?.data?.items ??
-        json?.data?.products ??
-        json?.data?.search?.products ??
-        json?.modules?.flatMap((m: any) => m.items ?? m.products ?? []) ??
-        [];
+// ─── Walmart search — Claude Vision reads the page ───────────────────────────
 
-      if (candidates.length > 0 && results.length === 0) {
-        console.log('[PRICE DEBUG] First candidate keys:', Object.keys(candidates[0]));
-        console.log('[PRICE DEBUG] First candidate:', JSON.stringify(candidates[0]).substring(0, 800));
-      }
-
-      for (const p of candidates) {
-        if (results.length >= 8) break;
-        const name = p.name ?? p.display_name ?? p.displayName ?? p.title;
-        if (!name) continue;
-        const productId: string = String(
-          p.productId ?? p.itemId ?? p.id ?? p.item_id ?? ""
-        );
-        const imageUrl: string =
-          p.imageUrl ?? p.image?.url ?? p.image ?? p.photo ?? "";
-        const product_url = productId
-          ? `https://www.walmart.ca/en/ip/${productId}`
-          : (p.productPageUrl ?? p.canonicalUrl ?? "");
-
-        results.push({
-          name,
-          price: extractPrice(p),
-          image: imageUrl,
-          product_url,
-        });
-      }
-    } catch { /* skip */ }
-  };
-
-  page.on("response", handler);
-
+async function searchWalmart(page: Page, query: string): Promise<SearchResult[]> {
   const searchUrl = `https://www.walmart.ca/search?q=${encodeURIComponent(query)}`;
 
   try {
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-    await page.waitForTimeout(7000);
-    await saveScreenshot(page, `search-${query.replace(/\s/g, "_").substring(0, 15)}`);
   } catch (err) {
-    console.log(`Search navigation error: ${err}`);
+    console.log(`[SEARCH] Navigation error: ${err}`);
+    return [];
   }
 
-  page.off("response", handler);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await page.waitForTimeout(3000);
+    const screenshot = (await page.screenshot()).toString("base64");
+    await saveScreenshot(page, `search-${query.replace(/\s/g, "_").substring(0, 15)}`);
 
-  console.log(`Search "${query}" → ${results.length} results`);
-  return results;
+    const response = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 2000,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: "image/png", data: screenshot } },
+          {
+            type: "text",
+            text: `Walmart Canada page after searching for "${query}". Respond with exactly ONE of:
+
+CAPTCHA: <exact visible text on the button or challenge to interact with>
+
+PRODUCTS: [{"name":"...","price":4.97,"image_url":"https://...","product_url":"https://www.walmart.ca/en/ip/..."}]
+
+EMPTY
+
+LOADING
+
+Rules:
+- CAPTCHA if there is any bot check, verification page, or "press and hold" challenge
+- PRODUCTS if grocery products are listed — extract up to 8. Price as a number. For product_url use the /en/ip/ URL if visible in the page links, otherwise use ${searchUrl}
+- EMPTY if search ran but no products found
+- LOADING if page is still rendering
+- Respond ONLY with the keyword and data, nothing else`,
+          },
+        ],
+      }],
+    });
+
+    const reply = (response.content[0] as Anthropic.TextBlock).text.trim();
+    console.log(`[SEARCH] "${query}" (${attempt + 1}): ${reply.substring(0, 120)}`);
+
+    if (reply.startsWith("CAPTCHA:")) {
+      const challenge = reply.replace(/^CAPTCHA:\s*/i, "").trim();
+      console.log(`[CAPTCHA] "${challenge}" — attempting hold...`);
+      await solvePressAndHold(page, challenge);
+      try { await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 30000 }); } catch {}
+      continue;
+    }
+
+    if (reply.startsWith("LOADING")) { continue; }
+
+    if (reply.startsWith("EMPTY")) { return []; }
+
+    if (reply.startsWith("PRODUCTS:")) {
+      try {
+        const jsonStr = reply.replace(/^PRODUCTS:\s*/i, "").trim();
+        const arr = JSON.parse(jsonStr.match(/\[[\s\S]*\]/)?.[0] ?? "[]");
+        const results: SearchResult[] = arr
+          .filter((p: any) => p.name)
+          .map((p: any) => ({
+            name: String(p.name),
+            price: parseFloat(String(p.price ?? 0).replace(/[^0-9.]/g, "")) || 0,
+            image: String(p.image_url ?? ""),
+            product_url: String(p.product_url ?? searchUrl),
+          }));
+        console.log(`[SEARCH] "${query}" → ${results.length} products`);
+        return results;
+      } catch (e) {
+        console.log(`[SEARCH] Parse error: ${e}`);
+        return [];
+      }
+    }
+  }
+
+  console.log(`[SEARCH] "${query}" → 0 results after all attempts`);
+  return [];
 }
 
 // ─── Agentic full-basket shopper ─────────────────────────────────────────────
@@ -390,28 +403,24 @@ async function addProductWithClaude(page: Page, product: SelectedProduct, worker
     await page.goto(product.product_url, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForTimeout(3000);
 
-    if (page.url().includes("/login") || page.url().includes("/sign_in")) {
-      console.log(`[W${workerIdx}] Session expired`);
-      return false;
-    }
-
-    for (let attempt = 0; attempt < 4; attempt++) {
+    for (let attempt = 0; attempt < 6; attempt++) {
       const screenshot = (await page.screenshot()).toString("base64");
 
       const response = await anthropic.messages.create({
         model: "claude-haiku-4-5-20251001",
-        max_tokens: 80,
+        max_tokens: 120,
         messages: [{
           role: "user",
           content: [
             { type: "image", source: { type: "base64", media_type: "image/png", data: screenshot } },
             {
               type: "text",
-              text: `Walmart Canada product page. Add "${product.product_name}" to cart.
+              text: `Walmart Canada page. Goal: add "${product.product_name}" to cart.
 
 Reply with exactly one of:
-CLICK: <exact text on the Add to cart button>
-DISMISS: <exact text on the popup close button>
+CLICK: <exact button text to click>
+HOLD: <exact text on the press-and-hold challenge button>
+DISMISS: <exact text on a popup to close first>
 DONE
 FAIL: <reason>`,
             },
@@ -424,6 +433,15 @@ FAIL: <reason>`,
 
       if (reply.startsWith("DONE")) return true;
       if (reply.startsWith("FAIL")) return false;
+
+      const holdMatch = reply.match(/^HOLD:\s*(.+)/i);
+      if (holdMatch) {
+        await solvePressAndHold(page, holdMatch[1].trim());
+        // After solving CAPTCHA, reload the product page
+        try { await page.goto(product.product_url, { waitUntil: "domcontentloaded", timeout: 30000 }); } catch {}
+        await page.waitForTimeout(3000);
+        continue;
+      }
 
       const clickMatch = reply.match(/^CLICK:\s*(.+)/i);
       const dismissMatch = reply.match(/^DISMISS:\s*(.+)/i);
@@ -444,7 +462,6 @@ FAIL: <reason>`,
       await page.waitForTimeout(1500);
 
       if (clickMatch) return true;
-      // DISMISS → loop and try again with fresh screenshot
     }
   } catch (err) {
     console.log(`[W${workerIdx}] Error on ${product.grocery_item_name}: ${err}`);
