@@ -16,10 +16,11 @@ import type { Cart, CartItem } from '../../lib/types'
 // retailerLocationId before we inject the mutation.
 // ---------------------------------------------------------------------------
 const INSTACART_INTERCEPT_JS = `
-window.__ctx={cid:null,lid:null,lidSaved:false,v4ids:{}};
+window.__ctx={cid:null,lid:null,slug:null,lidSaved:false,v4ids:{}};
 (function(){
   function scan(s){
     if(!window.__ctx.lid){var m2=s.match(/"retailerLocationId":"([^"]+)"/);if(m2)window.__ctx.lid=m2[1];}
+    if(!window.__ctx.slug){var ms=s.match(/"(?:storeSlug|retailerSlug|store_slug)":"([a-z][a-z0-9-]{2,50})"/);if(ms)window.__ctx.slug=ms[1];}
     // Capture every v4ItemId seen in API responses, keyed by productId
     var re=/"v4ItemId":"(items_([^-"]+)-([^"]+))"/g;var mx;
     while((mx=re.exec(s))!==null){window.__ctx.v4ids[mx[3]]=mx[1];}
@@ -29,7 +30,7 @@ window.__ctx={cid:null,lid:null,lidSaved:false,v4ids:{}};
     }
     if(window.__ctx.lid&&!window.__ctx.lidSaved){
       window.__ctx.lidSaved=true;
-      window.ReactNativeWebView.postMessage(JSON.stringify({type:'lid',lid:window.__ctx.lid}));
+      window.ReactNativeWebView.postMessage(JSON.stringify({type:'lid',lid:window.__ctx.lid,slug:window.__ctx.slug||null}));
     }
   }
   var fo=window.fetch;window.__f=fo;
@@ -74,12 +75,16 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
     return m?m[1]:null;
   }
 
-  // Fetch search page HTML (authenticated, so correct location) and extract first v4ItemId.
-  // 6-second timeout prevents hanging on slow/blocked responses.
+  // Fetch search page HTML (authenticated WebView session = user's location).
+  // Use store-specific URL if slug known, else storeless /store/s?k= (same as agent uses).
+  // 6-second timeout prevents hanging on slow responses.
   function searchForId(slug,name,cb){
     var done=false;
     var timer=setTimeout(function(){if(!done){done=true;cb(null);}},6000);
-    f('/store/'+slug+'/search_v3?q='+encodeURIComponent(name),{
+    var path=slug
+      ?'/store/'+slug+'/search_v3?q='+encodeURIComponent(name)
+      :'/store/s?k='+encodeURIComponent(name);
+    f(path,{
       credentials:'include',
       headers:{Accept:'text/html,*/*','Cache-Control':'no-cache'}
     }).then(function(r){return r.text();}).then(function(html){
@@ -117,7 +122,7 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
     });
   }
 
-  function resolveAndAdd(slug){
+  function resolveAndAdd(slug){  // slug may be null — storeless search is used as fallback
     var results=new Array(items.length).fill(null);
     var pending=items.length;
     items.forEach(function(item,i){
@@ -142,9 +147,8 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
   }
 
   var n=0;
-  var slug=null;
   function poll(){
-    if(!slug){for(var i=0;i<items.length;i++){slug=getSlug(items[i].productUrl);if(slug)break;}}
+    // Resolve lid from v4ids or __NEXT_DATA__ if intercept hasn't done it yet
     if(!ctx.lid&&Object.keys(ctx.v4ids).length>0){
       var first=Object.values(ctx.v4ids)[0];
       var lm=first.match(/^items_([^-]+)/);if(lm)ctx.lid=lm[1];
@@ -155,10 +159,17 @@ function makeAddJS(items: { productUrl: string; qty: number; name: string }[]): 
         var m2=nd.match(/"retailerLocationId":"([^"]+)"/);if(m2)ctx.lid=m2[1];
       }catch(e){}
     }
-    if(ctx.lid&&slug){resolveAndAdd(slug);return;}
+    if(ctx.lid){
+      // Best slug: from intercept → items' productUrls → current URL → null (uses storeless search)
+      var slug=ctx.slug||null;
+      if(!slug){for(var i=0;i<items.length;i++){slug=getSlug(items[i].productUrl);if(slug)break;}}
+      if(!slug){var um=window.location.href.match(/\\/store\\/([^/?#]+)/);if(um&&um[1]!=='s')slug=um[1];}
+      resolveAndAdd(slug);
+      return;
+    }
     n++;
     if(n<60)setTimeout(poll,500);
-    else window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:'url='+window.location.href+' lid='+ctx.lid+' slug='+slug}));
+    else window.ReactNativeWebView.postMessage(JSON.stringify({ok:false,err:'session_expired',debug:'url='+window.location.href+' lid='+ctx.lid+' slug='+ctx.slug}));
   }
   poll();
 })(${JSON.stringify(items)});
@@ -203,7 +214,7 @@ export default function CartScreen() {
 
   const router = useRouter()
   const instacartWebViewRef = useRef<WebViewType>(null)
-  const pendingItemsRef = useRef<{ productUrl: string; qty: number }[]>([])
+  const pendingItemsRef = useRef<{ productUrl: string; qty: number; name: string }[]>([])
   const toastAnim = useRef(new Animated.Value(-80)).current
 
   useEffect(() => {
@@ -349,15 +360,17 @@ export default function CartScreen() {
   async function handleInstacartMessage(event: { nativeEvent: { data: string } }) {
     try {
       const data = JSON.parse(event.nativeEvent.data) as {
-        type?: string; lid?: string;
+        type?: string; lid?: string; slug?: string | null;
         ok?: boolean; count?: number; added?: number; err?: string | null; debug?: string
       }
 
-      // Save the retailerLocationId to profile so the agent always shops at the right location
+      // Save lid and slug to profile so the agent always shops at the right location/store
       if (data.type === 'lid' && data.lid) {
         const { data: { user } } = await supabase.auth.getUser()
         if (user) {
-          await supabase.from('profiles').update({ preferred_location_id: data.lid }).eq('user_id', user.id)
+          const update: Record<string, string> = { preferred_location_id: data.lid }
+          if (data.slug) update.preferred_store_slug = data.slug
+          await supabase.from('profiles').update(update).eq('user_id', user.id)
         }
         return
       }

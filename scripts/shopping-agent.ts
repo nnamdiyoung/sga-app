@@ -174,9 +174,10 @@ async function searchInstacart(
 
   page.on("response", handler);
 
-  // Always use generic URL — store-specific URLs don't reliably trigger API responses
-  // in headless Chrome. We capture the redirected store and use it for product URLs only.
-  const searchUrl = `https://www.instacart.ca/store/s?k=${encodeURIComponent(query)}`;
+  // Use store-specific URL when we have the user's preferred slug, else fall back to generic.
+  const searchUrl = storeSlug
+    ? `https://www.instacart.ca/store/${storeSlug}/search_v3?k=${encodeURIComponent(query)}`
+    : `https://www.instacart.ca/store/s?k=${encodeURIComponent(query)}`;
 
   let detectedStoreSlug = "";
   try {
@@ -256,6 +257,7 @@ async function shopForGroceries(
   items: GroceryItem[],
   profile: Profile,
   preferredStore?: string,
+  preferredSlug?: string,
 ): Promise<SelectedProduct[]> {
   const itemList = items.map(i =>
     i.quantity && i.quantity !== '1'
@@ -295,6 +297,8 @@ Use your judgment. Be decisive.`,
 
   // Map product_url → instacart_item_id so we don't rely on Claude echoing it back
   const itemIdByUrl = new Map<string, string>();
+  // Track the store slug across searches — start with user's preferred store
+  let currentSlug = preferredSlug ?? '';
 
   let finalSelections: SelectedProduct[] = [];
   let isDone = false;
@@ -318,8 +322,10 @@ Use your judgment. Be decisive.`,
 
       if (block.name === "search_instacart") {
         const { query } = block.input as { query: string };
-        const { results, detectedStoreSlug } = await searchInstacart(page, query);
-        const storeName = detectedStoreSlug ? slugToStoreName(detectedStoreSlug) : "Instacart";
+        const { results, detectedStoreSlug } = await searchInstacart(page, query, currentSlug || undefined);
+        // Lock in the slug after the first successful detection so all searches use the same store
+        if (detectedStoreSlug && !currentSlug) currentSlug = detectedStoreSlug;
+        const storeName = slugToStoreName(currentSlug || detectedStoreSlug || 'instacart');
 
         // Store itemIds by URL so we can look them up at finalize time
         for (const r of results) {
@@ -680,12 +686,13 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   const context = await buildBrowserContext(browser, profile);
   const page = await context.newPage();
 
-  const preferredStore = process.env.STORE_SLUG ? slugToStoreName(process.env.STORE_SLUG) : null;
-  if (preferredStore) console.log(`Store preference: ${preferredStore}`);
+  const preferredSlug = process.env.STORE_SLUG ?? profile.preferred_store_slug ?? undefined;
+  const preferredStore = preferredSlug ? slugToStoreName(preferredSlug) : null;
+  if (preferredSlug) console.log(`Using store slug: ${preferredSlug} (store: ${preferredStore})`);
   if (profile.preferred_location_id) console.log(`User's last known retailerLocationId: ${profile.preferred_location_id}`);
 
   console.log(`\nStarting agentic shop for ${items.length} items...`);
-  const selectedProducts = await shopForGroceries(page, items, profile, preferredStore ?? undefined);
+  const selectedProducts = await shopForGroceries(page, items, profile, preferredStore ?? undefined, preferredSlug);
 
   // Claude reviews the cart for obvious errors (wrong category, allergen violations, etc.)
   const validatedProducts = await validateCartWithClaude(selectedProducts, items, profile);
