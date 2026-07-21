@@ -234,16 +234,17 @@ User preferences:
 - Allergies: ${profile.allergies?.join(", ") || "none"}
 - Preferred brands: ${profile.brands || "no strong preference"}${storeHint}
 
-Be smart about this:
-- Try to get everything from one store — it's better for the user (one checkout)
-- But don't skip an item just to stay in one store; finding the item matters more
-- Respect dietary restrictions and allergies strictly — never pick something that violates them
-- If budget is set, prefer value options and flag if total is likely over budget
-- If a search returns nothing, try a shorter or different term before giving up
-- Pick good value products that match the user's preferences
-- Once you have everything (or have genuinely tried), call finalize_cart with all your selections
+Shopping strategy:
+- **Strongly prefer one store** — the user gets one checkout, one delivery. This matters a lot.
+- Identify which store Instacart defaults to from your first search, then commit to it.
+- Only switch stores if an item is genuinely unavailable after 2 search attempts, OR if the price difference is extreme (e.g. 50%+ cheaper elsewhere for a high-cost item).
+- Never split stores just because another store is slightly cheaper — the convenience of one checkout is worth a few dollars.
+- Respect dietary restrictions and allergies strictly — never pick something that violates them.
+- If budget is set and total looks high, prefer store-brand or value options within the same store before going elsewhere.
+- If a search returns 0 results, try a simpler term before giving up.
+- Once you have everything (or genuinely exhausted options), call finalize_cart.
 
-Search however makes sense to you. Use your judgment.`,
+Use your judgment. Be decisive.`,
     },
   ];
 
@@ -322,43 +323,108 @@ Search however makes sense to you. Use your judgment.`,
   return finalSelections;
 }
 
-// ─── Instacart cart addition ──────────────────────────────────────────────────
+// ─── Claude-guided Instacart cart addition (vision) ──────────────────────────
 
-async function addToInstacartCart(page: Page, product: SelectedProduct): Promise<boolean> {
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+  return chunks;
+}
+
+async function addProductWithClaude(page: Page, product: SelectedProduct, workerIdx: number): Promise<boolean> {
   if (!product.product_url || product.product_name.startsWith('Search for "')) return false;
 
   try {
     await page.goto(product.product_url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(4000);
-    await saveScreenshot(page, `pre-add-${product.grocery_item_name.replace(/[^a-z0-9]/gi, "_").substring(0, 20)}`);
+    await page.waitForTimeout(3000);
 
-    // Redirect to login means session expired
     if (page.url().includes("/login") || page.url().includes("/sign_in")) {
-      console.log("Instacart session expired — cannot add to cart");
+      console.log(`[W${workerIdx}] Session expired`);
       return false;
     }
 
-    const selectors = [
-      '[data-testid="add-button"]',
-      '[data-testid="AddButton"]',
-      'button[aria-label*="Add to cart"]',
-      'button:has-text("Add to cart")',
-      'button:has-text("Add")',
-    ];
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const screenshot = await page.screenshot({ encoding: "base64" });
 
-    for (const sel of selectors) {
-      const btn = page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
-        await btn.click();
-        await page.waitForTimeout(2000);
-        return true;
-      }
+      const response = await anthropic.messages.create({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 80,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: "image/png", data: screenshot as string } },
+            {
+              type: "text",
+              text: `Instacart Canada product page. Add "${product.product_name}" to cart.
+
+Reply with exactly one of:
+CLICK: <exact text on the Add to cart button>
+DISMISS: <exact text on the popup close button>
+DONE
+FAIL: <reason>`,
+            },
+          ],
+        }],
+      });
+
+      const reply = ((response.content[0] as Anthropic.TextBlock).text ?? "").trim();
+      console.log(`[W${workerIdx}] ${product.grocery_item_name} (${attempt + 1}): ${reply}`);
+
+      if (reply.startsWith("DONE")) return true;
+      if (reply.startsWith("FAIL")) return false;
+
+      const clickMatch = reply.match(/^CLICK:\s*(.+)/i);
+      const dismissMatch = reply.match(/^DISMISS:\s*(.+)/i);
+      const label = (clickMatch?.[1] ?? dismissMatch?.[1] ?? "").trim();
+      if (!label) return false;
+
+      const clicked = await page.getByRole("button", { name: label, exact: false }).first()
+        .click({ force: true })
+        .then(() => true)
+        .catch(() =>
+          page.getByText(label, { exact: false }).first()
+            .click({ force: true })
+            .then(() => true)
+            .catch(() => false)
+        );
+
+      if (!clicked) { console.log(`[W${workerIdx}] Couldn't click "${label}"`); return false; }
+      await page.waitForTimeout(1500);
+
+      if (clickMatch) return true;
+      // DISMISS → loop and try again with fresh screenshot
     }
-
-    return false;
-  } catch {
-    return false;
+  } catch (err) {
+    console.log(`[W${workerIdx}] Error on ${product.grocery_item_name}: ${err}`);
   }
+
+  return false;
+}
+
+async function addProductsParallel(browser: Browser, profile: Profile, products: SelectedProduct[]): Promise<number> {
+  const valid = products.filter(p => p.product_url && !p.product_name.startsWith('Search for "'));
+  if (!valid.length) return 0;
+
+  const WORKERS = Math.min(3, valid.length);
+  const chunks = chunkArray(valid, Math.ceil(valid.length / WORKERS));
+  console.log(`\nAdding ${valid.length} items to Instacart (${WORKERS} parallel workers)...`);
+
+  const counts = await Promise.all(
+    chunks.map(async (chunk, idx) => {
+      const ctx = await buildBrowserContext(browser, profile);
+      const page = await ctx.newPage();
+      let added = 0;
+      for (const product of chunk) {
+        const ok = await addProductWithClaude(page, product, idx + 1);
+        console.log(ok ? `✓ [W${idx + 1}] ${product.product_name}` : `✗ [W${idx + 1}] ${product.grocery_item_name}`);
+        if (ok) added++;
+      }
+      await ctx.close();
+      return added;
+    })
+  );
+
+  return counts.reduce((s, n) => s + n, 0);
 }
 
 // ─── Email summary (Claude-written) ──────────────────────────────────────────
@@ -496,25 +562,16 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
     return;
   }
 
-  // Try adding directly to the user's Instacart cart via Playwright
+  await context.close();
+
+  // Add directly to the user's Instacart cart — parallel Claude-vision workers
   let instacartAdded = false;
   let addedCount = 0;
   if (profile.instacart_session) {
-    console.log("\nAdding items directly to Instacart cart...");
-    for (const product of selectedProducts) {
-      const success = await addToInstacartCart(page, product);
-      if (success) {
-        addedCount++;
-        console.log(`✓ Instacart cart: ${product.product_name}`);
-      } else {
-        console.log(`✗ Instacart cart skipped: ${product.grocery_item_name}`);
-      }
-    }
+    addedCount = await addProductsParallel(browser, profile, selectedProducts);
     instacartAdded = addedCount > 0;
     console.log(`Instacart: ${addedCount}/${selectedProducts.filter(p => !p.product_name.startsWith('Search for "')).length} items added`);
   }
-
-  await context.close();
 
   const total = selectedProducts.reduce((sum, p) => sum + (p.price ?? 0), 0);
 
