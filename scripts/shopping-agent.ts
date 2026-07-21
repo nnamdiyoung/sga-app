@@ -22,6 +22,7 @@ interface Profile {
   brands: string;
   instacart_session: string;
   preferred_store_slug?: string;
+  preferred_location_id?: string;
 }
 
 interface GroceryItem {
@@ -202,7 +203,8 @@ async function searchInstacart(
     }
   }
 
-  console.log(`Search "${query}" → ${results.length} results (store: ${detectedStoreSlug || "unknown"})`);
+  const detectedLid = results.find(r => r.instacart_item_id)?.instacart_item_id?.match(/^items_([^-]+)/)?.[1] ?? '';
+  console.log(`Search "${query}" → ${results.length} results (store: ${detectedStoreSlug || "unknown"}, lid: ${detectedLid || "unknown"})`);
   return { results, detectedStoreSlug };
 }
 
@@ -671,6 +673,7 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
 
   const preferredStore = process.env.STORE_SLUG ? slugToStoreName(process.env.STORE_SLUG) : null;
   if (preferredStore) console.log(`Store preference: ${preferredStore}`);
+  if (profile.preferred_location_id) console.log(`User's last known retailerLocationId: ${profile.preferred_location_id}`);
 
   console.log(`\nStarting agentic shop for ${items.length} items...`);
   const selectedProducts = await shopForGroceries(page, items, profile, preferredStore ?? undefined);

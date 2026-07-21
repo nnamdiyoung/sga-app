@@ -16,12 +16,16 @@ import type { Cart, CartItem } from '../../lib/types'
 // retailerLocationId before we inject the mutation.
 // ---------------------------------------------------------------------------
 const INSTACART_INTERCEPT_JS = `
-window.__ctx={cid:null,lid:null};
+window.__ctx={cid:null,lid:null,lidSaved:false};
 (function(){
   function scan(s){
     if(!window.__ctx.cid){var m=s.match(/"cartId":"([^"]+)"/);if(m)window.__ctx.cid=m[1];}
     if(!window.__ctx.lid){var m2=s.match(/"retailerLocationId":"([^"]+)"/);if(m2)window.__ctx.lid=m2[1];}
     if(!window.__ctx.lid){var m3=s.match(/"v4ItemId":"items_([^-"]+)-/);if(m3)window.__ctx.lid=m3[1];}
+    if(window.__ctx.lid&&!window.__ctx.lidSaved){
+      window.__ctx.lidSaved=true;
+      window.ReactNativeWebView.postMessage(JSON.stringify({type:'lid',lid:window.__ctx.lid}));
+    }
   }
   var fo=window.fetch;window.__f=fo;
   window.fetch=function(){
@@ -286,9 +290,21 @@ export default function CartScreen() {
 
   async function handleInstacartMessage(event: { nativeEvent: { data: string } }) {
     try {
-      const data = JSON.parse(event.nativeEvent.data) as { ok: boolean; count?: number; added?: number; err?: string | null }
-      console.log('[SGA] Instacart API result:', JSON.stringify(data))
+      const data = JSON.parse(event.nativeEvent.data) as {
+        type?: string; lid?: string;
+        ok?: boolean; count?: number; added?: number; err?: string | null; debug?: string
+      }
 
+      // Save the retailerLocationId to profile so the agent always shops at the right location
+      if (data.type === 'lid' && data.lid) {
+        const { data: { user } } = await supabase.auth.getUser()
+        if (user) {
+          await supabase.from('profiles').update({ preferred_location_id: data.lid }).eq('user_id', user.id)
+        }
+        return
+      }
+
+      console.log('[SGA] Instacart API result:', JSON.stringify(data))
       if (!data.ok) setInstacartDebug(data.debug ?? data.err ?? 'no detail')
       if (data.ok) {
         setInstacartCount(data.added ?? data.count ?? pendingItemsRef.current.length)
