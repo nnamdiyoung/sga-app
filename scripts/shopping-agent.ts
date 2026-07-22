@@ -106,7 +106,35 @@ async function solvePressAndHold(page: Page, buttonText: string): Promise<void> 
   }
 }
 
-// ─── Amazon search — Claude Vision reads the page ────────────────────────────
+// ─── Amazon search — DOM extraction for ASINs, Vision for CAPTCHA ────────────
+
+async function extractFromDOM(page: Page): Promise<SearchResult[]> {
+  try {
+    return await page.$$eval('[data-asin]', (els) =>
+      els
+        .filter(el => {
+          const asin = el.getAttribute('data-asin') ?? '';
+          return asin.length >= 9 && /^B[A-Z0-9]{9}$/.test(asin);
+        })
+        .slice(0, 6)
+        .map(el => {
+          const asin = el.getAttribute('data-asin')!;
+          const name =
+            el.querySelector('h2 span')?.textContent?.trim() ||
+            el.querySelector('[class*="title"] span')?.textContent?.trim() ||
+            el.querySelector('h2')?.textContent?.trim() || '';
+          const priceEl = el.querySelector('.a-price .a-offscreen');
+          const price = parseFloat((priceEl?.textContent ?? '').replace(/[^0-9.]/g, '')) || 0;
+          const img = el.querySelector('img[src*="media-amazon"]') || el.querySelector('img');
+          const image = img?.getAttribute('src') ?? '';
+          return { asin, name, price, image, product_url: `https://www.amazon.ca/dp/${asin}` };
+        })
+        .filter(p => p.asin && p.name)
+    );
+  } catch {
+    return [];
+  }
+}
 
 async function searchAmazon(page: Page, query: string): Promise<SearchResult[]> {
   const searchUrl = `https://www.amazon.ca/s?k=${encodeURIComponent(query)}`;
@@ -117,72 +145,43 @@ async function searchAmazon(page: Page, query: string): Promise<SearchResult[]> 
     return [];
   }
 
-  for (let attempt = 0; attempt < 4; attempt++) {
-    await page.waitForTimeout(4000);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await page.waitForTimeout(3000);
+
+    // Primary: pull ASINs directly from DOM — reliable, no screenshot needed
+    const domResults = await extractFromDOM(page);
+    if (domResults.length > 0) {
+      console.log(`[SEARCH] "${query}" → ${domResults.length} products (DOM)`);
+      return domResults;
+    }
+
+    // DOM returned nothing — use Claude Vision to diagnose why
     const screenshot = (await page.screenshot()).toString("base64");
     await saveScreenshot(page, `search-${query.replace(/\s/g, "_").substring(0, 15)}`);
 
     const response = await anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 2000,
+      max_tokens: 80,
       messages: [{
         role: "user",
         content: [
           { type: "image", source: { type: "base64", media_type: "image/png", data: screenshot } },
-          {
-            type: "text",
-            text: `Amazon Canada search results for "${query}". Respond with exactly ONE of:
-
-CAPTCHA: <describe the challenge>
-
-PRODUCTS: [{"name":"...","price":19.99,"asin":"B0XXXXXXXXX","image_url":"https://..."}]
-
-EMPTY
-
-LOADING
-
-Rules:
-- CAPTCHA if there is any robot check, verification, or CAPTCHA page
-- PRODUCTS if product listings are visible — extract up to 6 best matches. ASIN is the 10-character alphanumeric code (starts with B) found in product URLs like /dp/B0XXXXXXXXX/. Price as a number. Image URL if visible.
-- EMPTY if search completed but no products found
-- LOADING if the page is still loading
-- Respond ONLY with the keyword and data, nothing else`,
-          },
+          { type: "text", text: 'Amazon.ca page. Reply with exactly one word: CAPTCHA, LOADING, EMPTY, or PRODUCTS.' },
         ],
       }],
     });
 
-    const reply = (response.content[0] as Anthropic.TextBlock).text.trim();
-    console.log(`[SEARCH] "${query}" (${attempt + 1}): ${reply.substring(0, 120)}`);
+    const reply = (response.content[0] as Anthropic.TextBlock).text.trim().toUpperCase();
+    console.log(`[SEARCH] "${query}" (${attempt + 1}): DOM=0, Vision=${reply}`);
 
-    if (reply.startsWith("CAPTCHA:")) {
+    if (reply.includes("CAPTCHA")) {
       await page.waitForTimeout(6000);
       try { await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 30000 }); } catch {}
       continue;
     }
-    if (reply.startsWith("LOADING")) continue;
-    if (reply.startsWith("EMPTY")) return [];
-
-    if (reply.startsWith("PRODUCTS:")) {
-      try {
-        const jsonStr = reply.replace(/^PRODUCTS:\s*/i, "").trim();
-        const arr = JSON.parse(jsonStr.match(/\[[\s\S]*\]/)?.[0] ?? "[]");
-        const results: SearchResult[] = arr
-          .filter((p: any) => p.name && p.asin)
-          .map((p: any) => ({
-            name: String(p.name),
-            price: parseFloat(String(p.price ?? 0).replace(/[^0-9.]/g, "")) || 0,
-            image: String(p.image_url ?? ""),
-            product_url: `https://www.amazon.ca/dp/${String(p.asin).trim()}`,
-            asin: String(p.asin).trim(),
-          }));
-        console.log(`[SEARCH] "${query}" → ${results.length} products`);
-        return results;
-      } catch (e) {
-        console.log(`[SEARCH] Parse error: ${e}`);
-        return [];
-      }
-    }
+    if (reply.includes("LOADING")) continue;
+    if (reply.includes("EMPTY")) return [];
+    // PRODUCTS but DOM returned nothing — page may still be hydrating, retry
   }
 
   console.log(`[SEARCH] "${query}" → 0 results after all attempts`);

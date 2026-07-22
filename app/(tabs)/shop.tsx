@@ -1,10 +1,11 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   View, Text, TextInput, TouchableOpacity, FlatList,
   StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform,
   Alert, Modal, ActivityIndicator, RefreshControl
 } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
+import { useFocusEffect } from '@react-navigation/native'
 import { supabase } from '../../lib/supabase'
 import { colors, spacing, radius, font, shadow } from '../../lib/theme'
 import type { GroceryItem } from '../../lib/types'
@@ -17,11 +18,45 @@ export default function Shop() {
   const [itemQty, setItemQty] = useState('')
   const [adding, setAdding] = useState(false)
   const [agentRunning, setAgentRunning] = useState(false)
+  const [cartReady, setCartReady] = useState(false)
   const [aiModalVisible, setAiModalVisible] = useState(false)
   const [aiText, setAiText] = useState('')
   const [aiLoading, setAiLoading] = useState(false)
   const channelRef = useRef<any>(null)
   const userIdRef = useRef<string | null>(null)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const agentRunningRef = useRef(false)
+
+  useEffect(() => {
+    agentRunningRef.current = agentRunning
+  }, [agentRunning])
+
+  useFocusEffect(useCallback(() => {
+    if (agentRunningRef.current) startPollingForCart()
+    return () => {
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+    }
+  }, []))
+
+  async function startPollingForCart() {
+    if (pollRef.current) clearInterval(pollRef.current)
+    const uid = userIdRef.current
+    if (!uid) return
+
+    async function checkCart() {
+      const { data } = await supabase
+        .from('carts').select('id').eq('user_id', uid!).eq('status', 'pending').limit(1).maybeSingle()
+      if (data) {
+        setAgentRunning(false)
+        setCartReady(true)
+        if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+      }
+    }
+
+    await checkCart()
+    if (!agentRunningRef.current) return
+    pollRef.current = setInterval(checkCart, 15000)
+  }
 
   useEffect(() => {
     loadItems()
@@ -135,6 +170,7 @@ export default function Shop() {
 
   async function runRestock() {
     if (items.length === 0) return
+    setCartReady(false)
     setAgentRunning(true)
     try {
       const { data, error } = await supabase.functions.invoke('trigger-shopping-agent', { body: {} })
@@ -143,8 +179,8 @@ export default function Shop() {
         setAgentRunning(false)
         return
       }
-      Alert.alert('Restock Started', "We're finding the best products on Amazon. Check the Home tab in ~2 minutes.")
-      setAgentRunning(false)
+      // Keep agentRunning = true — poll until cart appears (~2 min)
+      startPollingForCart()
     } catch (e: any) {
       Alert.alert('Error', e?.message ?? 'Could not start.')
       setAgentRunning(false)
@@ -260,6 +296,19 @@ export default function Shop() {
             </TouchableOpacity>
           </View>
         </View>
+
+        {/* Agent status banners */}
+        {agentRunning && (
+          <View style={styles.agentBanner}>
+            <ActivityIndicator size="small" color={colors.primary} />
+            <Text style={styles.agentBannerText}>Shopping on Amazon… (~2 min)</Text>
+          </View>
+        )}
+        {cartReady && (
+          <View style={[styles.agentBanner, styles.agentBannerReady]}>
+            <Text style={styles.agentBannerText}>✅ Cart ready — check the Home tab</Text>
+          </View>
+        )}
 
         {/* Items list */}
         <FlatList
@@ -525,6 +574,26 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: spacing.md,
+  },
+  agentBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.primaryLight,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.primary,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: 10,
+  },
+  agentBannerReady: {
+    backgroundColor: 'rgba(34,197,94,0.12)',
+    borderBottomColor: colors.success,
+  },
+  agentBannerText: {
+    fontSize: font.size.sm,
+    fontWeight: '600',
+    color: colors.primary,
+    flex: 1,
   },
   emptyEmoji: { fontSize: 28 },
   emptyTitle: {
