@@ -1,9 +1,9 @@
 {
   "expo": {
-    "name": "SGA",
+    "name": "Restock",
     "slug": "sga-app",
     "version": "1.0.0",
-    "scheme": "sga",
+    "scheme": "restock",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",

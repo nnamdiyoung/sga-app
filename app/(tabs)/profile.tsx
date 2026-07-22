@@ -1,57 +1,39 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import {
   View, Text, TextInput, TouchableOpacity, ScrollView,
-  StyleSheet, SafeAreaView, Alert, Modal, ActivityIndicator
+  StyleSheet, SafeAreaView, Alert
 } from 'react-native'
-import { useLocalSearchParams } from 'expo-router'
-import { WebView } from 'react-native-webview'
-import type { WebView as WebViewType } from 'react-native-webview'
 import { supabase } from '../../lib/supabase'
 import { colors, spacing, radius, font } from '../../lib/theme'
 
-const DIETARY_OPTIONS = ['Vegetarian', 'Vegan', 'Halal', 'Kosher', 'Gluten-Free', 'Dairy-Free', 'Nut-Free']
+const HOUSEHOLD_OPTIONS = [
+  'Eco-Friendly',
+  'Fragrance-Free',
+  'Hypoallergenic',
+  'Bulk Buy',
+  'Premium Brands',
+  'Budget-Friendly',
+  'Unscented',
+  'Natural/Organic',
+]
 
-
-const CAPTURE_SESSION_JS = `
-  (function(){
-    var session = {
-      cookies: document.cookie,
-      localStorage: {}
-    };
-    try {
-      for(var i = 0; i < localStorage.length; i++){
-        var k = localStorage.key(i);
-        session.localStorage[k] = localStorage.getItem(k);
-      }
-    } catch(e){}
-    window.ReactNativeWebView.postMessage(JSON.stringify({type:'session',data:JSON.stringify(session)}));
-  })(); true;
-`
+const HOUSEHOLD_SIZES = ['1', '2', '3', '4', '5+']
 
 export default function Profile() {
-  const { connect } = useLocalSearchParams<{ connect?: string }>()
   const [budget, setBudget] = useState('')
-  const [dietary, setDietary] = useState<string[]>([])
-  const [allergyInput, setAllergyInput] = useState('')
-  const [allergies, setAllergies] = useState<string[]>([])
+  const [householdSize, setHouseholdSize] = useState(2)
+  const [preferences, setPreferences] = useState<string[]>([])
+  const [avoidInput, setAvoidInput] = useState('')
+  const [avoidList, setAvoidList] = useState<string[]>([])
   const [brandInput, setBrandInput] = useState('')
   const [brands, setBrands] = useState<string[]>([])
   const [saving, setSaving] = useState(false)
   const [profileId, setProfileId] = useState<string | null>(null)
   const [email, setEmail] = useState('')
-  const [walmartConnected, setWalmartConnected] = useState(false)
-  const [showWebView, setShowWebView] = useState(false)
-  const [capturingSession, setCapturingSession] = useState(false)
-  const webViewRef = useRef<WebViewType>(null)
-  const capturedRef = useRef(false)
 
   useEffect(() => {
     loadProfile()
   }, [])
-
-  useEffect(() => {
-    if (connect === '1') openWalmartConnect()
-  }, [connect])
 
   async function loadProfile() {
     const { data: { user } } = await supabase.auth.getUser()
@@ -67,23 +49,28 @@ export default function Profile() {
     if (data) {
       setProfileId(data.id)
       setBudget(String(data.budget ?? ''))
-      setDietary(data.dietary ?? [])
-      setAllergies(data.allergies ?? [])
+      setPreferences(data.dietary ?? [])
+      setAvoidList(data.allergies ?? [])
       setBrands(data.brands ?? [])
-      setWalmartConnected(!!data.walmart_session)
     }
   }
 
-  function toggleDietary(option: string) {
-    setDietary(prev => prev.includes(option) ? prev.filter(d => d !== option) : [...prev, option])
+  function togglePreference(option: string) {
+    setPreferences(prev =>
+      prev.includes(option) ? prev.filter(p => p !== option) : [...prev, option]
+    )
   }
 
-  function addAllergy() {
-    const val = allergyInput.trim()
-    if (val && !allergies.includes(val)) {
-      setAllergies(prev => [...prev, val])
-      setAllergyInput('')
+  function addAvoid() {
+    const val = avoidInput.trim()
+    if (val && !avoidList.includes(val)) {
+      setAvoidList(prev => [...prev, val])
+      setAvoidInput('')
     }
+  }
+
+  function removeAvoid(item: string) {
+    setAvoidList(prev => prev.filter(x => x !== item))
   }
 
   function addBrand() {
@@ -94,6 +81,10 @@ export default function Profile() {
     }
   }
 
+  function removeBrand(brand: string) {
+    setBrands(prev => prev.filter(x => x !== brand))
+  }
+
   async function saveProfile() {
     const { data: { user } } = await supabase.auth.getUser()
     if (!user) return
@@ -102,8 +93,8 @@ export default function Profile() {
     const payload = {
       user_id: user.id,
       budget: parseFloat(budget) || 0,
-      dietary,
-      allergies,
+      dietary: preferences,
+      allergies: avoidList,
       brands,
     }
 
@@ -118,64 +109,6 @@ export default function Profile() {
     Alert.alert('Saved', 'Your profile has been updated.')
   }
 
-  function openWalmartConnect() {
-    capturedRef.current = false
-    setCapturingSession(false)
-    setShowWebView(true)
-  }
-
-  function handleSignedIn() {
-    if (capturedRef.current) return
-    capturedRef.current = true
-    setCapturingSession(true)
-    webViewRef.current?.injectJavaScript(CAPTURE_SESSION_JS)
-  }
-
-  async function handleWebViewMessage(event: { nativeEvent: { data: string } }) {
-    try {
-      const parsed = JSON.parse(event.nativeEvent.data)
-      if (parsed.type !== 'session' || !parsed.data) {
-        setCapturingSession(false)
-        Alert.alert('Error', 'Could not capture session. Please try again.')
-        return
-      }
-
-      const { data: { user } } = await supabase.auth.getUser()
-      if (!user) return
-
-      const updatePayload = { walmart_session: parsed.data }
-      if (profileId) {
-        await supabase.from('profiles').update(updatePayload).eq('id', profileId)
-      } else {
-        await supabase.from('profiles').upsert({ user_id: user.id, ...updatePayload })
-      }
-
-      setWalmartConnected(true)
-      setCapturingSession(false)
-      setShowWebView(false)
-      Alert.alert('Connected!', 'Your Walmart account is now linked. The agent will use it for your next shopping run.')
-    } catch {
-      setCapturingSession(false)
-      Alert.alert('Error', 'Failed to save session. Please try again.')
-    }
-  }
-
-  async function disconnectWalmart() {
-    Alert.alert('Disconnect Walmart', 'Remove your Walmart session?', [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Disconnect',
-        style: 'destructive',
-        onPress: async () => {
-          if (profileId) {
-            await supabase.from('profiles').update({ walmart_session: '' }).eq('id', profileId)
-          }
-          setWalmartConnected(false)
-        }
-      }
-    ])
-  }
-
   async function handleSignOut() {
     Alert.alert('Sign Out', 'Are you sure?', [
       { text: 'Cancel', style: 'cancel' },
@@ -185,22 +118,25 @@ export default function Profile() {
 
   return (
     <SafeAreaView style={styles.container}>
-      <ScrollView contentContainerStyle={styles.content}>
+      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+
+        {/* Header */}
         <View style={styles.header}>
           <Text style={styles.title}>Profile</Text>
           <Text style={styles.subtitle}>{email}</Text>
         </View>
 
+        {/* Budget */}
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Weekly Budget</Text>
-          <Text style={styles.cardSubtitle}>SGA will stay under this amount per shop</Text>
+          <Text style={styles.cardTitle}>Monthly Budget</Text>
+          <Text style={styles.cardSubtitle}>Restock will stay under this amount per shop</Text>
           <View style={styles.budgetRow}>
             <Text style={styles.currencySymbol}>$</Text>
             <TextInput
               style={styles.budgetInput}
               value={budget}
               onChangeText={setBudget}
-              placeholder="150"
+              placeholder="200"
               placeholderTextColor={colors.textMuted}
               keyboardType="decimal-pad"
             />
@@ -208,66 +144,103 @@ export default function Profile() {
           </View>
         </View>
 
+        {/* Household Size */}
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Dietary Preferences</Text>
-          <Text style={styles.cardSubtitle}>SGA will only pick products that match</Text>
-          <View style={styles.tagsWrap}>
-            {DIETARY_OPTIONS.map(opt => (
-              <TouchableOpacity
-                key={opt}
-                style={[styles.tag, dietary.includes(opt) && styles.tagActive]}
-                onPress={() => toggleDietary(opt)}
-              >
-                <Text style={[styles.tagText, dietary.includes(opt) && styles.tagTextActive]}>{opt}</Text>
-              </TouchableOpacity>
-            ))}
+          <Text style={styles.cardTitle}>Household Size</Text>
+          <Text style={styles.cardSubtitle}>How many people in your home?</Text>
+          <View style={styles.sizeRow}>
+            {HOUSEHOLD_SIZES.map((size, idx) => {
+              const sizeNum = idx + 1
+              const isActive = householdSize === sizeNum
+              return (
+                <TouchableOpacity
+                  key={size}
+                  style={[styles.sizeBtn, isActive && styles.sizeBtnActive]}
+                  onPress={() => setHouseholdSize(sizeNum)}
+                  activeOpacity={0.75}
+                >
+                  <Text style={[styles.sizeBtnText, isActive && styles.sizeBtnTextActive]}>
+                    {size}
+                  </Text>
+                </TouchableOpacity>
+              )
+            })}
           </View>
         </View>
 
+        {/* Household Preferences */}
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Allergies</Text>
-          <Text style={styles.cardSubtitle}>SGA will avoid products containing these</Text>
+          <Text style={styles.cardTitle}>Household Preferences</Text>
+          <Text style={styles.cardSubtitle}>Restock will prioritize products that match</Text>
           <View style={styles.tagsWrap}>
-            {allergies.map(a => (
-              <TouchableOpacity
-                key={a}
-                style={[styles.tag, styles.tagDanger]}
-                onPress={() => setAllergies(prev => prev.filter(x => x !== a))}
-              >
-                <Text style={styles.tagDangerText}>{a} ✕</Text>
-              </TouchableOpacity>
-            ))}
+            {HOUSEHOLD_OPTIONS.map(opt => {
+              const isActive = preferences.includes(opt)
+              return (
+                <TouchableOpacity
+                  key={opt}
+                  style={[styles.chip, isActive && styles.chipActive]}
+                  onPress={() => togglePreference(opt)}
+                  activeOpacity={0.75}
+                >
+                  <Text style={[styles.chipText, isActive && styles.chipTextActive]}>{opt}</Text>
+                </TouchableOpacity>
+              )
+            })}
           </View>
+        </View>
+
+        {/* Avoid */}
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Avoid</Text>
+          <Text style={styles.cardSubtitle}>Restock will avoid products containing these</Text>
+          {avoidList.length > 0 && (
+            <View style={styles.tagsWrap}>
+              {avoidList.map(item => (
+                <TouchableOpacity
+                  key={item}
+                  style={styles.chipDanger}
+                  onPress={() => removeAvoid(item)}
+                  activeOpacity={0.75}
+                >
+                  <Text style={styles.chipDangerText}>{item} ✕</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          )}
           <View style={styles.inputRow}>
             <TextInput
               style={styles.inlineInput}
-              value={allergyInput}
-              onChangeText={setAllergyInput}
-              placeholder="e.g. peanuts"
+              value={avoidInput}
+              onChangeText={setAvoidInput}
+              placeholder="e.g. peanuts, latex"
               placeholderTextColor={colors.textMuted}
-              onSubmitEditing={addAllergy}
+              onSubmitEditing={addAvoid}
               returnKeyType="done"
             />
-            <TouchableOpacity style={styles.addTagBtn} onPress={addAllergy}>
-              <Text style={styles.addTagBtnText}>Add</Text>
+            <TouchableOpacity style={styles.addBtn} onPress={addAvoid}>
+              <Text style={styles.addBtnText}>Add</Text>
             </TouchableOpacity>
           </View>
         </View>
 
+        {/* Preferred Brands */}
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Favourite Brands</Text>
-          <Text style={styles.cardSubtitle}>SGA will prefer these when available</Text>
-          <View style={styles.tagsWrap}>
-            {brands.map(b => (
-              <TouchableOpacity
-                key={b}
-                style={[styles.tag, styles.tagGreen]}
-                onPress={() => setBrands(prev => prev.filter(x => x !== b))}
-              >
-                <Text style={styles.tagGreenText}>{b} ✕</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
+          <Text style={styles.cardTitle}>Preferred Brands</Text>
+          <Text style={styles.cardSubtitle}>Restock will prioritize these brands when available</Text>
+          {brands.length > 0 && (
+            <View style={styles.tagsWrap}>
+              {brands.map(brand => (
+                <TouchableOpacity
+                  key={brand}
+                  style={styles.chipBrand}
+                  onPress={() => removeBrand(brand)}
+                  activeOpacity={0.75}
+                >
+                  <Text style={styles.chipBrandText}>{brand} ✕</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          )}
           <View style={styles.inputRow}>
             <TextInput
               style={styles.inlineInput}
@@ -278,106 +251,44 @@ export default function Profile() {
               onSubmitEditing={addBrand}
               returnKeyType="done"
             />
-            <TouchableOpacity style={styles.addTagBtn} onPress={addBrand}>
-              <Text style={styles.addTagBtnText}>Add</Text>
+            <TouchableOpacity style={styles.addBtn} onPress={addBrand}>
+              <Text style={styles.addBtnText}>Add</Text>
             </TouchableOpacity>
           </View>
         </View>
 
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Walmart Canada Account</Text>
-          <Text style={styles.cardSubtitle}>Connect your Walmart Canada account so SGA can add groceries to your cart automatically.</Text>
-          {walmartConnected ? (
-            <View style={styles.connectedRow}>
-              <View style={styles.connectedBadge}>
-                <View style={styles.connectedDot} />
-                <Text style={styles.connectedText}>✓ Walmart Connected</Text>
-              </View>
-              <TouchableOpacity onPress={disconnectWalmart}>
-                <Text style={styles.disconnectText}>Reconnect Walmart</Text>
-              </TouchableOpacity>
-            </View>
-          ) : (
-            <>
-              <Text style={styles.secureNote}>Not connected</Text>
-              <TouchableOpacity style={styles.connectBtn} onPress={openWalmartConnect}>
-                <Text style={styles.connectBtnText}>Connect Walmart Account</Text>
-              </TouchableOpacity>
-            </>
-          )}
-          <Text style={styles.secureNote}>Your session is encrypted and only used by the shopping agent</Text>
-        </View>
-
+        {/* Save */}
         <TouchableOpacity
           style={[styles.saveBtn, saving && styles.saveBtnDisabled]}
           onPress={saveProfile}
           disabled={saving}
+          activeOpacity={0.85}
         >
           <Text style={styles.saveBtnText}>{saving ? 'Saving...' : 'Save Profile'}</Text>
         </TouchableOpacity>
 
-        <TouchableOpacity style={styles.signOutBtn} onPress={handleSignOut}>
+        {/* Sign Out */}
+        <TouchableOpacity
+          style={styles.signOutBtn}
+          onPress={handleSignOut}
+          activeOpacity={0.75}
+        >
           <Text style={styles.signOutText}>Sign Out</Text>
         </TouchableOpacity>
+
       </ScrollView>
-
-      <Modal visible={showWebView} animationType="slide" presentationStyle="fullScreen">
-        <SafeAreaView style={styles.modalContainer}>
-          <View style={styles.modalHeader}>
-            <View>
-              <Text style={styles.modalTitle}>Connect Walmart</Text>
-              <Text style={styles.modalSubtitle}>Log in with your Walmart Canada account</Text>
-            </View>
-            <TouchableOpacity
-              style={styles.modalCloseBtn}
-              onPress={() => setShowWebView(false)}
-            >
-              <Text style={styles.modalCloseBtnText}>Cancel</Text>
-            </TouchableOpacity>
-          </View>
-
-          {capturingSession && (
-            <View style={styles.capturingOverlay}>
-              <ActivityIndicator size="large" color={colors.primary} />
-              <Text style={styles.capturingText}>Saving your session...</Text>
-            </View>
-          )}
-
-          <WebView
-            ref={webViewRef}
-            source={{ uri: 'https://www.walmart.ca/account/login' }}
-            style={styles.webView}
-            onMessage={handleWebViewMessage}
-            javaScriptEnabled
-            domStorageEnabled
-            sharedCookiesEnabled
-            thirdPartyCookiesEnabled
-            userAgent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-          />
-
-          <View style={styles.modalFooter}>
-            <TouchableOpacity
-              style={styles.signedInBtn}
-              onPress={handleSignedIn}
-              disabled={capturingSession}
-            >
-              <Text style={styles.signedInBtnText}>
-                {capturingSession ? 'Saving...' : "I'm Signed In →"}
-              </Text>
-            </TouchableOpacity>
-          </View>
-        </SafeAreaView>
-      </Modal>
     </SafeAreaView>
   )
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
-  content: { padding: spacing.lg, gap: spacing.md },
-  header: { marginBottom: spacing.sm },
+  content: { padding: spacing.lg, gap: spacing.md, paddingBottom: spacing.xxl },
+
+  header: { marginBottom: spacing.xs },
   title: { fontSize: font.size.xxl, fontWeight: '800', color: colors.textPrimary },
   subtitle: { fontSize: font.size.sm, color: colors.textSecondary, marginTop: 2 },
+
   card: {
     backgroundColor: colors.card,
     borderRadius: radius.lg,
@@ -388,6 +299,8 @@ const styles = StyleSheet.create({
   },
   cardTitle: { fontSize: font.size.md, fontWeight: '700', color: colors.textPrimary },
   cardSubtitle: { fontSize: font.size.sm, color: colors.textSecondary },
+
+  // Budget
   budgetRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
   currencySymbol: { fontSize: font.size.xl, fontWeight: '700', color: colors.textPrimary },
   budgetInput: {
@@ -400,26 +313,73 @@ const styles = StyleSheet.create({
     paddingBottom: 4,
   },
   currencyCode: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '600' },
+
+  // Household Size
+  sizeRow: { flexDirection: 'row', gap: spacing.sm },
+  sizeBtn: {
+    flex: 1,
+    paddingVertical: spacing.sm,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.cardMid,
+    alignItems: 'center',
+  },
+  sizeBtnActive: {
+    backgroundColor: colors.primaryLight,
+    borderColor: colors.primary,
+  },
+  sizeBtnText: {
+    fontSize: font.size.sm,
+    fontWeight: '600',
+    color: colors.textSecondary,
+  },
+  sizeBtnTextActive: { color: colors.primary },
+
+  // Chips (preferences)
   tagsWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm },
-  tag: {
+  chip: {
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
     borderRadius: radius.full,
     borderWidth: 1,
     borderColor: colors.border,
-    backgroundColor: colors.background,
+    backgroundColor: colors.cardMid,
   },
-  tagActive: { backgroundColor: colors.primary, borderColor: colors.primary },
-  tagText: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '500' },
-  tagTextActive: { color: '#fff', fontWeight: '600' },
-  tagDanger: { backgroundColor: colors.dangerLight, borderColor: colors.danger },
-  tagDangerText: { fontSize: font.size.sm, color: colors.danger, fontWeight: '500' },
-  tagGreen: { backgroundColor: colors.primaryLight, borderColor: colors.primary },
-  tagGreenText: { fontSize: font.size.sm, color: colors.primary, fontWeight: '500' },
+  chipActive: {
+    backgroundColor: colors.primaryLight,
+    borderColor: colors.primary,
+  },
+  chipText: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '500' },
+  chipTextActive: { color: colors.primary, fontWeight: '600' },
+
+  // Danger chips (Avoid)
+  chipDanger: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderRadius: radius.full,
+    borderWidth: 1,
+    borderColor: colors.danger,
+    backgroundColor: colors.dangerLight,
+  },
+  chipDangerText: { fontSize: font.size.sm, color: colors.danger, fontWeight: '500' },
+
+  // Brand chips
+  chipBrand: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderRadius: radius.full,
+    borderWidth: 1,
+    borderColor: colors.primary,
+    backgroundColor: colors.primaryLight,
+  },
+  chipBrandText: { fontSize: font.size.sm, color: colors.primary, fontWeight: '500' },
+
+  // Input row
   inputRow: { flexDirection: 'row', gap: spacing.sm, alignItems: 'center' },
   inlineInput: {
     flex: 1,
-    backgroundColor: colors.background,
+    backgroundColor: colors.cardMid,
     borderWidth: 1,
     borderColor: colors.border,
     borderRadius: radius.md,
@@ -428,103 +388,33 @@ const styles = StyleSheet.create({
     fontSize: font.size.sm,
     color: colors.textPrimary,
   },
-  addTagBtn: {
+  addBtn: {
     paddingHorizontal: spacing.md,
     paddingVertical: 10,
     backgroundColor: colors.primary,
     borderRadius: radius.md,
   },
-  addTagBtnText: { color: '#fff', fontWeight: '600', fontSize: font.size.sm },
-  connectedRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: colors.primaryLight,
-    borderRadius: radius.md,
-    paddingHorizontal: spacing.md,
-    paddingVertical: 12,
-  },
-  connectedBadge: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
-  connectedDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: colors.primary,
-  },
-  connectedText: { fontSize: font.size.sm, fontWeight: '600', color: colors.primary },
-  disconnectText: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '500' },
-  connectBtn: {
-    backgroundColor: colors.primary,
-    borderRadius: radius.md,
-    paddingVertical: 13,
-    alignItems: 'center',
-  },
-  connectBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.sm },
-  secureNote: { fontSize: font.size.xs, color: colors.textMuted },
+  addBtnText: { color: '#fff', fontWeight: '600', fontSize: font.size.sm },
+
+  // Save
   saveBtn: {
     backgroundColor: colors.primary,
     borderRadius: radius.md,
     paddingVertical: 16,
     alignItems: 'center',
+    marginTop: spacing.sm,
   },
   saveBtnDisabled: { opacity: 0.6 },
   saveBtnText: { color: '#fff', fontSize: font.size.md, fontWeight: '700' },
+
+  // Sign Out
   signOutBtn: {
     borderRadius: radius.md,
     paddingVertical: 16,
     alignItems: 'center',
     borderWidth: 1,
     borderColor: colors.border,
-    marginBottom: spacing.xl,
+    marginBottom: spacing.sm,
   },
   signOutText: { fontSize: font.size.md, color: colors.textSecondary, fontWeight: '600' },
-  modalContainer: { flex: 1, backgroundColor: colors.background },
-  modalHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.md,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-    backgroundColor: colors.card,
-  },
-  modalTitle: { fontSize: font.size.md, fontWeight: '700', color: colors.textPrimary },
-  modalSubtitle: { fontSize: font.size.xs, color: colors.textSecondary, marginTop: 2 },
-  modalCloseBtn: {
-    paddingHorizontal: spacing.md,
-    paddingVertical: 8,
-    borderRadius: radius.md,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  modalCloseBtnText: { fontSize: font.size.sm, color: colors.textSecondary, fontWeight: '600' },
-  webView: { flex: 1 },
-  modalFooter: {
-    padding: spacing.md,
-    paddingBottom: spacing.xl,
-    backgroundColor: colors.card,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-  },
-  signedInBtn: {
-    backgroundColor: colors.primary,
-    borderRadius: radius.md,
-    paddingVertical: 16,
-    alignItems: 'center',
-  },
-  signedInBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
-  capturingOverlay: {
-    position: 'absolute',
-    top: 80,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(255,255,255,0.9)',
-    zIndex: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: spacing.md,
-  },
-  capturingText: { fontSize: font.size.md, color: colors.textPrimary, fontWeight: '600' },
 })

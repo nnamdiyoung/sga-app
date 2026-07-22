@@ -40,7 +40,7 @@ Deno.serve(async (req) => {
     max_tokens: 600,
     messages: [{
       role: 'user',
-      content: `You are a smart grocery assistant. Convert this request into a structured grocery list.
+      content: `You are a smart household restock assistant. Convert this request into a structured list of household items to order.
 
 User request: "${text}"
 Dietary preferences: ${dietary}
@@ -50,13 +50,13 @@ Return ONLY a valid JSON array — no explanation, no markdown, no extra text:
 [{"name": "item name", "quantity": "amount (e.g. '2', '500g', '1 dozen', '1')"}]
 
 Rules:
-- Use common grocery store names (what you'd search for)
+- Use product names you'd search for on Amazon (what you'd search for)
 - Keep names short and specific (1–4 words)
-- Infer quantities from context ("for 4 people", "weekly", etc.)
+- Infer quantities from context ("cleaning supplies for the bathroom", "laundry and kitchen essentials", etc.)
 - Respect dietary preferences and allergies — never include restricted items
-- If the request mentions a meal, include all the main ingredients
-- If the request is already a single grocery item, return it as-is
-- If unclear or not food-related, return []`,
+- If the request mentions a category, include all the main items
+- If the request is already a single household item, return it as-is
+- If completely unclear or irrelevant, return []`,
     }],
   })
 

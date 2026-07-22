@@ -1,575 +1,397 @@
 import { useState, useEffect, useRef } from 'react'
 import {
-  View, Text, TextInput, TouchableOpacity, FlatList,
-  StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform,
-  Alert, Animated, RefreshControl, Modal, ActivityIndicator
+  View, Text, TouchableOpacity, FlatList, StyleSheet,
+  SafeAreaView, Image, Linking, Alert, ActivityIndicator, RefreshControl, ScrollView,
 } from 'react-native'
+import { router } from 'expo-router'
 import { Ionicons } from '@expo/vector-icons'
 import { supabase } from '../../lib/supabase'
 import { colors, spacing, radius, font, shadow } from '../../lib/theme'
-import type { GroceryItem } from '../../lib/types'
+import type { Cart, CartItem } from '../../lib/types'
 
-const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+function buildAmazonCartUrl(items: CartItem[]): string {
+  const params: string[] = []
+  let idx = 1
+  for (const item of items) {
+    const src = item.asin || item.product_url || ''
+    const match = src.match(/\/dp\/([A-Z0-9]{10})|^([A-Z0-9]{10})$/)
+    const asin = match?.[1] || match?.[2]
+    if (asin) {
+      params.push(`ASIN.${idx}=${asin}`, `Quantity.${idx}=1`)
+      idx++
+    }
+  }
+  if (params.length === 0) return 'https://www.amazon.ca'
+  return `https://www.amazon.ca/gp/aws/cart/add.html?${params.join('&')}`
+}
 
-export default function GroceryList() {
-  const [items, setItems] = useState<GroceryItem[]>([])
-  const [input, setInput] = useState('')
-  const [quantity, setQuantity] = useState('')
+function getFirstName(user: any): string {
+  const raw =
+    user?.user_metadata?.full_name?.split(' ')?.[0] ||
+    user?.email?.split('@')?.[0]?.split('.')?.[0] ||
+    'there'
+  return raw.charAt(0).toUpperCase() + raw.slice(1)
+}
+
+function StarRating({ rating }: { rating: number }) {
+  return (
+    <View style={styles.starsRow}>
+      {[1, 2, 3, 4, 5].map(i => (
+        <Ionicons
+          key={i}
+          name={rating >= i ? 'star' : rating >= i - 0.5 ? 'star-half' : 'star-outline'}
+          size={12}
+          color={colors.primary}
+        />
+      ))}
+    </View>
+  )
+}
+
+export default function HomeScreen() {
+  const [firstName, setFirstName] = useState('there')
+  const [cart, setCart] = useState<Cart | null>(null)
   const [loading, setLoading] = useState(true)
-  const [nextShop, setNextShop] = useState<string | null>(null)
-
-  // AI expand state
-  const [showAIModal, setShowAIModal] = useState(false)
-  const [aiText, setAIText] = useState('')
-  const [aiLoading, setAILoading] = useState(false)
-  const [aiResult, setAIResult] = useState<string | null>(null)
-
-  const inputRef = useRef<TextInput>(null)
-  const aiInputRef = useRef<TextInput>(null)
+  const [refreshing, setRefreshing] = useState(false)
+  const [agentRunning, setAgentRunning] = useState(false)
+  const [shopping, setShopping] = useState(false)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const userIdRef = useRef<string | null>(null)
 
   useEffect(() => {
-    let channel: ReturnType<typeof supabase.channel> | null = null
-
-    async function init() {
-      fetchNextShop()
-      const { data: { user } } = await supabase.auth.getUser()
-      if (!user) return
-
-      await fetchItems()
-
-      channel = supabase
-        .channel('grocery-items-cleared')
-        .on('postgres_changes', {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'grocery_items',
-        }, (payload) => {
-          if (payload.new.user_id === user.id) fetchItems()
-        })
-        .subscribe()
-    }
-
     init()
-    return () => { channel?.unsubscribe() }
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [])
 
-  async function fetchItems() {
+  async function init() {
     const { data: { user } } = await supabase.auth.getUser()
     if (!user) return
-    const { data } = await supabase
-      .from('grocery_items')
-      .select('*')
-      .eq('user_id', user.id)
-      .eq('cleared', false)
-      .order('added_at', { ascending: false })
-    setItems(data ?? [])
+    userIdRef.current = user.id
+    setFirstName(getFirstName(user))
+    await fetchCart(user.id)
     setLoading(false)
   }
 
-  async function fetchNextShop() {
-    const { data: { user } } = await supabase.auth.getUser()
-    if (!user) return
+  async function fetchCart(userId?: string): Promise<Cart | null> {
+    const uid = userId || userIdRef.current
+    if (!uid) return null
     const { data } = await supabase
-      .from('schedules')
-      .select('days, time, active')
-      .eq('user_id', user.id)
-      .single()
-    if (!data || !data.active || !data.days?.length) return
-
-    const now = new Date()
-    const currentDay = now.getDay()
-    const sortedDays = [...data.days].sort((a, b) => a - b)
-    const next = sortedDays.find(d => d > currentDay) ?? sortedDays[0]
-    const daysUntil = next > currentDay ? next - currentDay : 7 - currentDay + next
-    const nextDate = new Date(now)
-    nextDate.setDate(now.getDate() + daysUntil)
-    const [h] = (data.time ?? '09:00').split(':')
-    const hour = parseInt(h)
-    const timeStr = hour === 0 ? '12:00 AM' : hour < 12 ? `${hour}:00 AM` : hour === 12 ? '12:00 PM' : `${hour - 12}:00 PM`
-    setNextShop(`${DAYS[next]} ${nextDate.toLocaleDateString('en-CA', { month: 'short', day: 'numeric' })} at ${timeStr}`)
+      .from('carts')
+      .select('*, items:cart_items(*)')
+      .eq('user_id', uid)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    setCart(data ?? null)
+    return data ?? null
   }
 
-  async function addItem() {
-    const name = input.trim()
-    if (!name) return
-    const { data: { user } } = await supabase.auth.getUser()
-    if (!user) return
-
-    const newItem = {
-      user_id: user.id,
-      name,
-      quantity: quantity.trim() || '1',
-      notes: '',
-      cleared: false,
-    }
-
-    const { data } = await supabase.from('grocery_items').insert(newItem).select().single()
-    if (data) setItems(prev => [data, ...prev])
-    setInput('')
-    setQuantity('')
-    inputRef.current?.focus()
-  }
-
-  async function removeItem(id: string) {
-    await supabase.from('grocery_items').update({ cleared: true }).eq('id', id)
-    setItems(prev => prev.filter(i => i.id !== id))
-  }
-
-  async function clearAll() {
-    Alert.alert('Clear List', 'Remove all items from your list?', [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Clear', style: 'destructive',
-        onPress: async () => {
-          const { data: { user } } = await supabase.auth.getUser()
-          if (!user) return
-          await supabase.from('grocery_items').update({ cleared: true }).eq('user_id', user.id).eq('cleared', false)
-          setItems([])
-        }
+  function startPollingForCart() {
+    if (pollRef.current) clearInterval(pollRef.current)
+    pollRef.current = setInterval(async () => {
+      const found = await fetchCart()
+      if (found) {
+        clearInterval(pollRef.current!)
+        pollRef.current = null
+        setAgentRunning(false)
       }
-    ])
+    }, 15000)
   }
 
-  function openAIModal() {
-    setAIText('')
-    setAIResult(null)
-    setShowAIModal(true)
-    setTimeout(() => aiInputRef.current?.focus(), 300)
-  }
-
-  async function runAIExpand() {
-    if (!aiText.trim() || aiLoading) return
-    setAILoading(true)
-    setAIResult(null)
-
-    const { data, error } = await supabase.functions.invoke('expand-grocery-list', {
-      body: { text: aiText.trim() },
-    })
-
-    if (error || !data?.items?.length) {
-      setAILoading(false)
-      setAIResult("Couldn't expand that — try being more specific (e.g. 'pasta carbonara for 2').")
-      return
+  async function shopNow() {
+    setShopping(true)
+    try {
+      const { data, error } = await supabase.functions.invoke('trigger-shopping-agent', { body: {} })
+      if (error || !data?.success) {
+        Alert.alert('Error', error?.message ?? data?.error ?? 'Could not start Restock.')
+        setShopping(false)
+        return
+      }
+      setShopping(false)
+      setAgentRunning(true)
+      startPollingForCart()
+    } catch (e: any) {
+      Alert.alert('Error', e?.message ?? 'Could not start.')
+      setShopping(false)
     }
+  }
 
-    const { data: { user } } = await supabase.auth.getUser()
-    if (!user) { setAILoading(false); return }
+  async function handleRefresh() {
+    setRefreshing(true)
+    await fetchCart()
+    setRefreshing(false)
+  }
 
-    const rows = (data.items as { name: string; quantity: string }[]).map(i => ({
-      user_id: user.id,
-      name: i.name,
-      quantity: i.quantity || '1',
-      notes: '',
-      cleared: false,
-    }))
+  function openAmazonCart() {
+    if (!cart?.items?.length) return
+    Linking.openURL(buildAmazonCartUrl(cart.items))
+  }
 
-    const { data: inserted } = await supabase.from('grocery_items').insert(rows).select()
-    if (inserted) setItems(prev => [...inserted, ...prev])
+  const total = cart?.items?.reduce((s, i) => s + i.price, 0) ?? 0
+  const itemCount = cart?.items?.length ?? 0
 
-    setAILoading(false)
-    setAIResult(`Added ${inserted?.length ?? rows.length} item${rows.length !== 1 ? 's' : ''} to your list`)
-    setTimeout(() => setShowAIModal(false), 1200)
+  if (loading) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.center}>
+          <ActivityIndicator size="large" color={colors.primary} />
+        </View>
+      </SafeAreaView>
+    )
   }
 
   return (
     <SafeAreaView style={styles.container}>
-      <View style={styles.header}>
-        <View>
-          <Text style={styles.title}>My List</Text>
-          {nextShop && (
-            <View style={styles.nextShopBadge}>
-              <Ionicons name="time-outline" size={12} color={colors.primary} />
-              <Text style={styles.nextShopText}>SGA shops {nextShop}</Text>
-            </View>
-          )}
-        </View>
-        <View style={styles.headerActions}>
-          {items.length > 0 && (
-            <TouchableOpacity onPress={clearAll} style={styles.clearBtn}>
-              <Text style={styles.clearBtnText}>Clear all</Text>
-            </TouchableOpacity>
-          )}
-          <TouchableOpacity onPress={openAIModal} style={styles.aiBtn}>
-            <Ionicons name="sparkles" size={16} color={colors.primary} />
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      <View style={styles.statsRow}>
-        <View style={styles.statCard}>
-          <Text style={styles.statNumber}>{items.length}</Text>
-          <Text style={styles.statLabel}>Items</Text>
-        </View>
-        <TouchableOpacity style={[styles.statCard, { backgroundColor: colors.primaryLight }]} onPress={openAIModal} activeOpacity={0.75}>
-          <Ionicons name="sparkles" size={18} color={colors.primary} />
-          <Text style={[styles.statLabel, { color: colors.primary }]}>Ask SGA</Text>
-        </TouchableOpacity>
-      </View>
-
-      <KeyboardAvoidingView
-        style={{ flex: 1 }}
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        keyboardVerticalOffset={90}
+      <ScrollView
+        contentContainerStyle={styles.content}
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} tintColor={colors.primary} />
+        }
       >
-        <FlatList
-          data={items}
-          keyExtractor={item => item.id}
-          contentContainerStyle={styles.list}
-          showsVerticalScrollIndicator={false}
-          refreshControl={<RefreshControl refreshing={false} onRefresh={fetchItems} tintColor={colors.primary} />}
-          ListEmptyComponent={
-            !loading ? (
-              <View style={styles.empty}>
-                <View style={styles.emptyIconWrap}>
-                  <Text style={styles.emptyIcon}>🛍️</Text>
-                </View>
-                <Text style={styles.emptyTitle}>Your list is empty</Text>
-                <Text style={styles.emptyText}>
-                  Add items below, or tap{' '}
-                  <Text style={{ color: colors.primary, fontWeight: '700' }}>Ask SGA</Text>
-                  {' '}to describe what you need.
-                </Text>
+        {/* Header */}
+        <View style={styles.header}>
+          <View style={styles.brandRow}>
+            <View style={styles.brandDot} />
+            <Text style={styles.brandLabel}>RESTOCK</Text>
+          </View>
+          <Text style={styles.greeting}>Ready to restock,{'\n'}{firstName}?</Text>
+          <Text style={styles.greetingSub}>Here's what's ready this month</Text>
+        </View>
+
+        {/* Cart state card */}
+        {agentRunning ? (
+          <View style={[styles.cartCard, styles.cartCardActive]}>
+            <View style={styles.cartCardRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.cartCardLabel}>SHOPPING NOW</Text>
+                <Text style={styles.cartCardTitle}>Shopping on Amazon...</Text>
+                <Text style={styles.cartCardSub}>Finding best products for you (~2 min)</Text>
               </View>
-            ) : null
-          }
-          renderItem={({ item, index }) => (
-            <View style={styles.item}>
-              <View style={styles.itemLeft}>
-                <View style={styles.itemIndex}>
-                  <Text style={styles.itemIndexText}>{index + 1}</Text>
-                </View>
-                <View style={styles.itemText}>
-                  <Text style={styles.itemName}>{item.name}</Text>
-                  {item.quantity !== '1' && (
-                    <Text style={styles.itemQty}>Qty: {item.quantity}</Text>
-                  )}
-                </View>
+              <ActivityIndicator color={colors.primary} size="small" />
+            </View>
+          </View>
+        ) : cart && itemCount > 0 ? (
+          <View style={[styles.cartCard, styles.cartCardActive]}>
+            <Text style={styles.cartCardLabel}>MONTHLY CART</Text>
+            <Text style={styles.cartCardTitle}>Your monthly cart is ready</Text>
+            <Text style={styles.cartCardSub}>
+              {itemCount} item{itemCount !== 1 ? 's' : ''} · est. ${total.toFixed(0)} · AI curated today
+            </Text>
+            <TouchableOpacity style={styles.openCartBtn} onPress={openAmazonCart}>
+              <Text style={styles.openCartBtnText}>Open Amazon Cart →</Text>
+            </TouchableOpacity>
+          </View>
+        ) : (
+          <View style={styles.cartCard}>
+            <View style={styles.cartCardRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.cartCardTitle}>Ready to shop?</Text>
+                <Text style={styles.cartCardSub}>Run Restock to find the best deals on Amazon</Text>
               </View>
-              <TouchableOpacity onPress={() => removeItem(item.id)} style={styles.removeBtn}>
-                <Ionicons name="close" size={14} color={colors.danger} />
+              <TouchableOpacity
+                style={[styles.shopNowBtn, shopping && styles.shopNowBtnDisabled]}
+                onPress={shopNow}
+                disabled={shopping}
+              >
+                {shopping
+                  ? <ActivityIndicator color="#fff" size="small" />
+                  : <Text style={styles.shopNowBtnText}>Shop Now</Text>
+                }
               </TouchableOpacity>
             </View>
-          )}
-        />
-
-        <View style={styles.inputArea}>
-          <View style={styles.inputRow}>
-            <TextInput
-              ref={inputRef}
-              style={styles.itemInput}
-              value={input}
-              onChangeText={setInput}
-              placeholder="Add an item..."
-              placeholderTextColor={colors.textMuted}
-              onSubmitEditing={addItem}
-              returnKeyType="done"
-            />
-            <TextInput
-              style={styles.qtyInput}
-              value={quantity}
-              onChangeText={setQuantity}
-              placeholder="Qty"
-              placeholderTextColor={colors.textMuted}
-            />
-            <TouchableOpacity style={styles.addBtn} onPress={addItem}>
-              <Ionicons name="add" size={24} color="#fff" />
-            </TouchableOpacity>
           </View>
+        )}
+
+        {/* Smart Picks */}
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>Smart Picks This Month</Text>
+          <TouchableOpacity onPress={() => router.push('/(tabs)/cart')}>
+            <Text style={styles.seeAll}>See all</Text>
+          </TouchableOpacity>
         </View>
-      </KeyboardAvoidingView>
 
-      {/* AI Expand Modal */}
-      <Modal visible={showAIModal} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setShowAIModal(false)}>
-        <SafeAreaView style={styles.aiModal}>
-          <View style={styles.aiModalHeader}>
-            <View style={styles.aiModalTitleRow}>
-              <Ionicons name="sparkles" size={20} color={colors.primary} />
-              <Text style={styles.aiModalTitle}>Ask SGA</Text>
-            </View>
-            <TouchableOpacity onPress={() => setShowAIModal(false)} style={styles.aiModalClose}>
-              <Ionicons name="close" size={22} color={colors.textSecondary} />
+        {cart?.items?.length ? (
+          cart.items.map(item => (
+            <ProductCard key={item.id} item={item} />
+          ))
+        ) : (
+          <View style={styles.emptyPicks}>
+            <Text style={styles.emptyPicksText}>
+              Your AI-curated picks will appear here after Restock runs.
+            </Text>
+            <TouchableOpacity onPress={() => router.push('/(tabs)/shop')} style={styles.goShopBtn}>
+              <Text style={styles.goShopBtnText}>Manage My List →</Text>
             </TouchableOpacity>
           </View>
-
-          <View style={styles.aiModalBody}>
-            <Text style={styles.aiModalHint}>
-              Describe what you need and SGA will build your list.
-            </Text>
-            <Text style={styles.aiModalExamples}>
-              "Pasta carbonara for 4"  ·  "Healthy meal prep for the week"  ·  "Breakfast items"
-            </Text>
-
-            <TextInput
-              ref={aiInputRef}
-              style={styles.aiTextInput}
-              value={aiText}
-              onChangeText={setAIText}
-              placeholder="What do you need?"
-              placeholderTextColor={colors.textMuted}
-              multiline
-              returnKeyType="send"
-              onSubmitEditing={runAIExpand}
-              blurOnSubmit
-            />
-
-            {aiResult && (
-              <Text style={[
-                styles.aiResultText,
-                aiResult.startsWith("Couldn't") ? { color: colors.danger } : { color: colors.primary }
-              ]}>
-                {aiResult}
-              </Text>
-            )}
-
-            <TouchableOpacity
-              style={[styles.aiSendBtn, (!aiText.trim() || aiLoading) && { opacity: 0.5 }]}
-              onPress={runAIExpand}
-              disabled={!aiText.trim() || aiLoading}
-            >
-              {aiLoading ? (
-                <ActivityIndicator color="#fff" size="small" />
-              ) : (
-                <>
-                  <Ionicons name="sparkles" size={16} color="#fff" />
-                  <Text style={styles.aiSendBtnText}>Generate List</Text>
-                </>
-              )}
-            </TouchableOpacity>
-          </View>
-        </SafeAreaView>
-      </Modal>
+        )}
+      </ScrollView>
     </SafeAreaView>
+  )
+}
+
+function ProductCard({ item }: { item: CartItem }) {
+  return (
+    <View style={styles.productCard}>
+      <View style={styles.productRow}>
+        {item.image_url ? (
+          <Image source={{ uri: item.image_url }} style={styles.productImage} resizeMode="contain" />
+        ) : (
+          <View style={[styles.productImage, styles.productImagePlaceholder]}>
+            <Text style={styles.productImagePlaceholderText}>
+              {item.product_name?.charAt(0)?.toUpperCase() ?? '?'}
+            </Text>
+          </View>
+        )}
+        <View style={styles.productInfo}>
+          <Text style={styles.productName} numberOfLines={2}>{item.product_name}</Text>
+          <Text style={styles.productBrand}>{item.store}</Text>
+          {item.rating !== undefined && (
+            <View style={styles.ratingRow}>
+              <StarRating rating={item.rating} />
+              <Text style={styles.ratingText}>
+                {item.rating.toFixed(1)}{item.review_count ? ` · ${item.review_count.toLocaleString()} reviews` : ''}
+              </Text>
+            </View>
+          )}
+          <Text style={styles.productPrice}>${item.price.toFixed(2)}</Text>
+          {item.ai_note ? (
+            <Text style={styles.aiNote}>{item.ai_note}</Text>
+          ) : null}
+        </View>
+        <View style={styles.aiBadge}>
+          <Text style={styles.aiBadgeText}>Ai pick</Text>
+        </View>
+      </View>
+      <TouchableOpacity style={styles.swapBtn}>
+        <Text style={styles.swapBtnText}>Swap</Text>
+      </TouchableOpacity>
+    </View>
   )
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-    paddingHorizontal: spacing.lg,
-    paddingTop: spacing.lg,
-    paddingBottom: spacing.sm,
+  center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  content: { padding: spacing.lg, gap: spacing.md, paddingBottom: spacing.xl },
+
+  // Header
+  header: { gap: spacing.xs, marginBottom: spacing.sm },
+  brandRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: spacing.xs },
+  brandDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: colors.primary },
+  brandLabel: {
+    fontSize: 11, fontWeight: '800', color: colors.primary,
+    letterSpacing: 2, textTransform: 'uppercase',
   },
-  title: {
-    fontSize: font.size.xxl,
-    fontWeight: '800',
-    color: colors.textPrimary,
-    letterSpacing: -0.5,
+  greeting: {
+    fontSize: font.size.xxl, fontWeight: '800', color: colors.textPrimary,
+    lineHeight: 34,
   },
-  nextShopBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    marginTop: 4,
-  },
-  nextShopText: {
-    fontSize: font.size.xs,
-    color: colors.primary,
-    fontWeight: '600',
-  },
-  headerActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
+  greetingSub: { fontSize: font.size.sm, color: colors.textMuted, marginTop: 2 },
+
+  // Cart card
+  cartCard: {
+    backgroundColor: colors.card,
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    borderWidth: 1,
+    borderColor: colors.border,
     gap: spacing.sm,
-    marginTop: 4,
   },
-  clearBtn: {
+  cartCardActive: { borderColor: colors.primary },
+  cartCardRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  cartCardLabel: {
+    fontSize: 11, fontWeight: '800', color: colors.primary,
+    letterSpacing: 1.5, textTransform: 'uppercase',
+  },
+  cartCardTitle: { fontSize: font.size.lg, fontWeight: '800', color: colors.textPrimary },
+  cartCardSub: { fontSize: font.size.sm, color: colors.textSecondary, marginTop: 2 },
+  openCartBtn: {
+    backgroundColor: colors.primary,
+    borderRadius: radius.md,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginTop: spacing.xs,
+  },
+  openCartBtnText: { color: '#fff', fontSize: font.size.md, fontWeight: '800' },
+  shopNowBtn: {
+    backgroundColor: colors.primary,
+    borderRadius: radius.md,
+    paddingVertical: 10,
     paddingHorizontal: spacing.md,
-    paddingVertical: spacing.xs,
-    borderRadius: radius.full,
-    backgroundColor: colors.dangerLight,
+    minWidth: 90,
+    alignItems: 'center',
   },
-  clearBtnText: { fontSize: font.size.sm, color: colors.danger, fontWeight: '600' },
-  aiBtn: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    backgroundColor: colors.primaryLight,
+  shopNowBtnDisabled: { opacity: 0.6 },
+  shopNowBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.sm },
+
+  // Section
+  sectionHeader: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    marginTop: spacing.sm,
+  },
+  sectionTitle: { fontSize: font.size.md, fontWeight: '800', color: colors.textPrimary },
+  seeAll: { fontSize: font.size.sm, color: colors.primary, fontWeight: '600' },
+
+  // Product card
+  productCard: {
+    backgroundColor: colors.card,
+    borderRadius: radius.lg,
+    padding: spacing.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    gap: spacing.sm,
+  },
+  productRow: { flexDirection: 'row', gap: spacing.md },
+  productImage: { width: 64, height: 64, borderRadius: radius.sm },
+  productImagePlaceholder: {
+    backgroundColor: colors.cardMid,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  statsRow: {
-    flexDirection: 'row',
-    gap: spacing.sm,
-    paddingHorizontal: spacing.lg,
-    paddingBottom: spacing.md,
+  productImagePlaceholderText: { fontSize: 24, fontWeight: '800', color: colors.primary },
+  productInfo: { flex: 1, gap: 3 },
+  productName: { fontSize: font.size.sm, fontWeight: '700', color: colors.textPrimary, lineHeight: 18 },
+  productBrand: { fontSize: font.size.xs, color: colors.textSecondary },
+  ratingRow: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  starsRow: { flexDirection: 'row', gap: 1 },
+  ratingText: { fontSize: font.size.xs, color: colors.textSecondary },
+  productPrice: { fontSize: font.size.sm, fontWeight: '700', color: colors.textPrimary, marginTop: 2 },
+  aiNote: { fontSize: font.size.xs, color: colors.textMuted, fontStyle: 'italic', marginTop: 2 },
+  aiBadge: {
+    backgroundColor: colors.primaryLight,
+    borderRadius: radius.sm,
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    alignSelf: 'flex-start',
   },
-  statCard: {
-    flex: 1,
-    backgroundColor: colors.card,
-    borderRadius: radius.md,
-    padding: spacing.md,
+  aiBadgeText: { fontSize: 10, fontWeight: '700', color: colors.primary },
+  swapBtn: {
+    alignSelf: 'flex-start',
+    borderWidth: 1,
+    borderColor: colors.primary,
+    borderRadius: radius.full,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 6,
+  },
+  swapBtnText: { fontSize: font.size.xs, fontWeight: '700', color: colors.primary },
+
+  // Empty
+  emptyPicks: {
     alignItems: 'center',
-    gap: 2,
-    ...shadow.sm,
-  },
-  statNumber: {
-    fontSize: font.size.xl,
-    fontWeight: '800',
-    color: colors.textPrimary,
-  },
-  statLabel: {
-    fontSize: font.size.xs,
-    color: colors.textSecondary,
-    fontWeight: '600',
-  },
-  list: {
-    paddingHorizontal: spacing.lg,
-    paddingBottom: spacing.lg,
-    gap: spacing.sm,
-  },
-  empty: {
-    alignItems: 'center',
-    paddingTop: spacing.xxl * 1.5,
-    paddingHorizontal: spacing.xl,
+    paddingVertical: spacing.xl,
     gap: spacing.md,
   },
-  emptyIconWrap: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
-    backgroundColor: colors.primaryLight,
-    alignItems: 'center',
-    justifyContent: 'center',
+  emptyPicksText: {
+    fontSize: font.size.sm, color: colors.textMuted, textAlign: 'center', lineHeight: 20,
   },
-  emptyIcon: { fontSize: 36 },
-  emptyTitle: {
-    fontSize: font.size.lg,
-    fontWeight: '700',
-    color: colors.textPrimary,
-  },
-  emptyText: {
-    fontSize: font.size.sm,
-    color: colors.textSecondary,
-    textAlign: 'center',
-    lineHeight: 20,
-  },
-  item: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: colors.card,
-    borderRadius: radius.md,
-    paddingHorizontal: spacing.md,
-    paddingVertical: 14,
-    ...shadow.sm,
-  },
-  itemLeft: { flexDirection: 'row', alignItems: 'center', gap: spacing.md, flex: 1 },
-  itemIndex: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: colors.primaryLight,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  itemIndexText: { fontSize: font.size.xs, fontWeight: '700', color: colors.primary },
-  itemText: { flex: 1 },
-  itemName: { fontSize: font.size.md, color: colors.textPrimary, fontWeight: '600' },
-  itemQty: { fontSize: font.size.xs, color: colors.textSecondary, marginTop: 2 },
-  removeBtn: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: colors.dangerLight,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  inputArea: {
-    backgroundColor: colors.card,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-    padding: spacing.md,
-    ...shadow.md,
-  },
-  inputRow: { flexDirection: 'row', gap: spacing.sm, alignItems: 'center' },
-  itemInput: {
-    flex: 1,
-    backgroundColor: colors.background,
+  goShopBtn: {
     borderWidth: 1,
-    borderColor: colors.border,
+    borderColor: colors.primary,
     borderRadius: radius.md,
-    paddingHorizontal: spacing.md,
-    paddingVertical: 12,
-    fontSize: font.size.md,
-    color: colors.textPrimary,
-  },
-  qtyInput: {
-    width: 56,
-    backgroundColor: colors.background,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radius.md,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: 12,
-    fontSize: font.size.sm,
-    color: colors.textPrimary,
-    textAlign: 'center',
-  },
-  addBtn: {
-    width: 46,
-    height: 46,
-    borderRadius: radius.md,
-    backgroundColor: colors.primary,
-    alignItems: 'center',
-    justifyContent: 'center',
-    ...shadow.sm,
-  },
-  // AI Modal
-  aiModal: { flex: 1, backgroundColor: colors.background },
-  aiModalHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
+    paddingVertical: 10,
     paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.md,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
   },
-  aiModalTitleRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
-  aiModalTitle: { fontSize: font.size.lg, fontWeight: '700', color: colors.textPrimary },
-  aiModalClose: { padding: spacing.xs },
-  aiModalBody: { padding: spacing.lg, gap: spacing.md },
-  aiModalHint: {
-    fontSize: font.size.md,
-    color: colors.textPrimary,
-    fontWeight: '600',
-  },
-  aiModalExamples: {
-    fontSize: font.size.sm,
-    color: colors.textMuted,
-    lineHeight: 20,
-  },
-  aiTextInput: {
-    backgroundColor: colors.card,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radius.md,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.md,
-    fontSize: font.size.md,
-    color: colors.textPrimary,
-    minHeight: 100,
-    textAlignVertical: 'top',
-    marginTop: spacing.sm,
-  },
-  aiResultText: {
-    fontSize: font.size.sm,
-    fontWeight: '600',
-    textAlign: 'center',
-  },
-  aiSendBtn: {
-    backgroundColor: colors.primary,
-    borderRadius: radius.md,
-    paddingVertical: 14,
-    alignItems: 'center',
-    justifyContent: 'center',
-    flexDirection: 'row',
-    gap: spacing.sm,
-    marginTop: spacing.sm,
-    ...shadow.sm,
-  },
-  aiSendBtnText: { color: '#fff', fontSize: font.size.md, fontWeight: '700' },
+  goShopBtnText: { color: colors.primary, fontWeight: '700', fontSize: font.size.sm },
 })

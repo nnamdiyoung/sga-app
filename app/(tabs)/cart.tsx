@@ -5,8 +5,34 @@ import {
 } from 'react-native'
 import { Ionicons } from '@expo/vector-icons'
 import { supabase } from '../../lib/supabase'
-import { colors, spacing, radius, font } from '../../lib/theme'
+import { colors, spacing, radius, font, shadow } from '../../lib/theme'
 import type { Cart, CartItem } from '../../lib/types'
+
+// ---------------------------------------------------------------------------
+// Amazon shared cart URL builder
+// ---------------------------------------------------------------------------
+function buildAmazonCartUrl(items: CartItem[]): string {
+  const params: string[] = []
+  let idx = 1
+  for (const item of items) {
+    const src = item.asin || item.product_url || ''
+    const match = src.match(/\/dp\/([A-Z0-9]{10})|^([A-Z0-9]{10})$/)
+    const asin = match?.[1] || match?.[2]
+    if (asin) {
+      params.push(`ASIN.${idx}=${asin}`, `Quantity.${idx}=1`)
+      idx++
+    }
+  }
+  if (params.length === 0) return 'https://www.amazon.ca'
+  return `https://www.amazon.ca/gp/aws/cart/add.html?${params.join('&')}`
+}
+
+function hasAmazonASINs(items: CartItem[]): boolean {
+  return items.some(item => {
+    const src = item.asin || item.product_url || ''
+    return /\/dp\/([A-Z0-9]{10})|^([A-Z0-9]{10})$/.test(src)
+  })
+}
 
 // ---------------------------------------------------------------------------
 // Component
@@ -111,44 +137,50 @@ export default function CartScreen() {
   }
 
   // ---------------------------------------------------------------------------
-  // Render helpers
+  // Render
   // ---------------------------------------------------------------------------
   const Toast = (
     <Animated.View style={[styles.toast, { transform: [{ translateY: toastAnim }] }]}>
-      <Text style={styles.toastText}>🛒 Your cart is ready!</Text>
+      <Text style={styles.toastText}>Your cart is ready!</Text>
     </Animated.View>
   )
 
   if (loading) return (
     <SafeAreaView style={styles.container}>
-      <View style={styles.center}><Text style={styles.loadingText}>Loading cart...</Text></View>
+      <View style={styles.center}>
+        <Text style={styles.loadingText}>Loading cart...</Text>
+      </View>
     </SafeAreaView>
   )
 
   if (!cart || cart.items.length === 0) return (
     <SafeAreaView style={styles.container}>
       {Toast}
-      <View style={styles.header}><Text style={styles.title}>Cart</Text></View>
+      <View style={styles.header}>
+        <Text style={styles.title}>Cart</Text>
+      </View>
       <View style={styles.center}>
         <Text style={styles.emptyIcon}>🛒</Text>
         <Text style={styles.emptyTitle}>No cart ready yet</Text>
         <Text style={styles.emptyText}>
-          Once SGA runs on your scheduled day, your AI-curated cart will appear here for review.
+          Run Restock from the Shop tab to get your AI-curated Amazon picks.
         </Text>
       </View>
     </SafeAreaView>
   )
 
   const total = cart.items.reduce((sum, item) => sum + item.price, 0)
+  const cartDate = new Date(cart.created_at).toLocaleDateString('en-CA', { month: 'short', day: 'numeric' })
+  const canOpenAmazon = hasAmazonASINs(cart.items)
 
   return (
     <SafeAreaView style={styles.container}>
       {Toast}
       <View style={styles.header}>
         <View style={{ flex: 1 }}>
-          <Text style={styles.title}>Your Cart</Text>
+          <Text style={styles.title}>Cart</Text>
           <Text style={styles.subtitle}>
-            {cart.items.length} items · AI picked on {new Date(cart.created_at).toLocaleDateString('en-CA', { month: 'short', day: 'numeric' })}
+            {cart.items.length} {cart.items.length === 1 ? 'item' : 'items'} · AI picked on {cartDate}
           </Text>
         </View>
       </View>
@@ -169,10 +201,7 @@ export default function CartScreen() {
           ) : null
         }
         renderItem={({ item }) => (
-          <TouchableOpacity
-            activeOpacity={0.85}
-            style={styles.cartItem}
-          >
+          <View style={styles.cartItem}>
             {item.image_url ? (
               <Image
                 source={{ uri: item.image_url }}
@@ -200,33 +229,39 @@ export default function CartScreen() {
                 <Text style={styles.removeBtnText}>Remove</Text>
               </TouchableOpacity>
             </View>
-          </TouchableOpacity>
+          </View>
         )}
         ListFooterComponent={
-          <View style={styles.footer}>
+          <View style={styles.footerCard}>
             <View style={styles.totalRow}>
               <Text style={styles.totalLabel}>Estimated Total</Text>
               <Text style={styles.totalValue}>${total.toFixed(2)}</Text>
             </View>
             <Text style={styles.footerNote}>Final price may vary at checkout</Text>
+            <Text style={styles.footerNoteXs}>Amazon cart is built from ASINs in product URLs</Text>
           </View>
         }
       />
 
       <View style={styles.checkoutBar}>
-        {cart.walmart_added ? (
+        {canOpenAmazon ? (
           <TouchableOpacity
             style={styles.checkoutBtn}
-            onPress={() => { Linking.openURL('https://www.walmart.ca/cart'); markCheckedOut() }}
+            onPress={() => {
+              Linking.openURL(buildAmazonCartUrl(cart.items))
+              markCheckedOut()
+            }}
+            activeOpacity={0.85}
           >
-            <Text style={styles.checkoutBtnText}>Open Walmart Cart →</Text>
+            <Text style={styles.checkoutBtnText}>Open Amazon Cart →</Text>
           </TouchableOpacity>
         ) : (
           <TouchableOpacity
             style={styles.checkoutBtn}
-            onPress={() => Linking.openURL('https://www.walmart.ca/cart')}
+            onPress={() => Linking.openURL('https://www.amazon.ca')}
+            activeOpacity={0.85}
           >
-            <Text style={styles.checkoutBtnText}>View Cart on Walmart →</Text>
+            <Text style={styles.checkoutBtnText}>View Amazon.ca →</Text>
           </TouchableOpacity>
         )}
       </View>
@@ -237,7 +272,7 @@ export default function CartScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: spacing.xl },
-  loadingText: { color: colors.textSecondary },
+  loadingText: { color: colors.textSecondary, fontSize: font.size.sm },
   header: {
     flexDirection: 'row',
     alignItems: 'flex-end',
@@ -248,9 +283,24 @@ const styles = StyleSheet.create({
   title: { fontSize: font.size.xxl, fontWeight: '800', color: colors.textPrimary },
   subtitle: { fontSize: font.size.sm, color: colors.textSecondary, marginTop: 2 },
   emptyIcon: { fontSize: 48, marginBottom: spacing.md },
-  emptyTitle: { fontSize: font.size.lg, fontWeight: '700', color: colors.textPrimary, marginBottom: spacing.sm },
-  emptyText: { fontSize: font.size.sm, color: colors.textSecondary, textAlign: 'center', lineHeight: 20 },
-  list: { paddingHorizontal: spacing.lg, paddingBottom: 120, gap: spacing.sm },
+  emptyTitle: {
+    fontSize: font.size.lg,
+    fontWeight: '700',
+    color: colors.textPrimary,
+    marginBottom: spacing.sm,
+  },
+  emptyText: {
+    fontSize: font.size.sm,
+    color: colors.textSecondary,
+    textAlign: 'center',
+    lineHeight: 20,
+  },
+  list: {
+    paddingHorizontal: spacing.lg,
+    paddingBottom: 120,
+    paddingTop: spacing.sm,
+    gap: spacing.sm,
+  },
   aiSummaryCard: {
     flexDirection: 'row',
     alignItems: 'flex-start',
@@ -272,7 +322,6 @@ const styles = StyleSheet.create({
     backgroundColor: colors.card,
     borderRadius: radius.md,
     padding: spacing.md,
-    marginBottom: spacing.sm,
     borderWidth: 1,
     borderColor: colors.border,
     gap: spacing.md,
@@ -295,12 +344,26 @@ const styles = StyleSheet.create({
     color: colors.primary,
   },
   productInfo: { flex: 1, gap: 2 },
-  productName: { fontSize: font.size.sm, fontWeight: '600', color: colors.textPrimary, lineHeight: 18 },
-  productStore: { fontSize: font.size.xs, color: colors.primary, fontWeight: '600', marginTop: 2 },
+  productName: {
+    fontSize: font.size.sm,
+    fontWeight: '600',
+    color: colors.textPrimary,
+    lineHeight: 18,
+  },
+  productStore: {
+    fontSize: font.size.xs,
+    color: colors.primary,
+    fontWeight: '600',
+    marginTop: 2,
+  },
   productFor: { fontSize: font.size.xs, color: colors.textMuted },
   productQty: { fontSize: font.size.xs, color: colors.textSecondary, fontWeight: '500' },
   productRight: { alignItems: 'flex-end', gap: spacing.sm },
-  productPrice: { fontSize: font.size.md, fontWeight: '700', color: colors.textPrimary },
+  productPrice: {
+    fontSize: font.size.md,
+    fontWeight: '700',
+    color: colors.textPrimary,
+  },
   removeBtn: {
     paddingHorizontal: spacing.sm,
     paddingVertical: 4,
@@ -308,18 +371,25 @@ const styles = StyleSheet.create({
     backgroundColor: colors.dangerLight,
   },
   removeBtnText: { fontSize: font.size.xs, color: colors.danger, fontWeight: '600' },
-  footer: {
+  footerCard: {
     backgroundColor: colors.card,
     borderRadius: radius.lg,
     padding: spacing.md,
     borderWidth: 1,
     borderColor: colors.border,
+    marginTop: spacing.xs,
     marginBottom: spacing.md,
+    gap: spacing.xs,
   },
-  totalRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  totalRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
   totalLabel: { fontSize: font.size.md, fontWeight: '600', color: colors.textPrimary },
   totalValue: { fontSize: font.size.xl, fontWeight: '800', color: colors.primary },
-  footerNote: { fontSize: font.size.xs, color: colors.textMuted, marginTop: spacing.xs },
+  footerNote: { fontSize: font.size.xs, color: colors.textMuted, marginTop: 2 },
+  footerNoteXs: { fontSize: 11, color: colors.textMuted, marginTop: 1 },
   checkoutBar: {
     position: 'absolute',
     bottom: 0,
@@ -338,15 +408,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   checkoutBtnText: { color: '#fff', fontSize: font.size.md, fontWeight: '700' },
-  openInstacartBtn: {
-    backgroundColor: colors.primary,
-    borderRadius: radius.md,
-    paddingVertical: 14,
-    paddingHorizontal: spacing.xl,
-    alignItems: 'center',
-    width: '100%',
-  },
-  openInstacartBtnText: { color: '#fff', fontWeight: '700', fontSize: font.size.md },
   toast: {
     position: 'absolute',
     top: 0,

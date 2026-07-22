@@ -39,7 +39,14 @@ export default function TabsLayout() {
       <Tabs.Screen
         name="index"
         options={{
-          title: 'List',
+          title: 'Home',
+          tabBarIcon: ({ focused }) => icon(focused, 'home', 'home-outline'),
+        }}
+      />
+      <Tabs.Screen
+        name="shop"
+        options={{
+          title: 'Shop',
           tabBarIcon: ({ focused }) => icon(focused, 'list', 'list-outline'),
         }}
       />
@@ -48,13 +55,6 @@ export default function TabsLayout() {
         options={{
           title: 'Cart',
           tabBarIcon: ({ focused }) => icon(focused, 'cart', 'cart-outline'),
-        }}
-      />
-      <Tabs.Screen
-        name="schedule"
-        options={{
-          title: 'Schedule',
-          tabBarIcon: ({ focused }) => icon(focused, 'calendar', 'calendar-outline'),
         }}
       />
       <Tabs.Screen

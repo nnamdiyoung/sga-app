@@ -40,6 +40,10 @@ export type CartItem = {
   store: string
   swapped: boolean
   quantity?: string
+  asin?: string
+  ai_note?: string
+  rating?: number
+  review_count?: number
 }
 
 export type UserProfile = {

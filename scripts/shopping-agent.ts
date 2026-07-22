@@ -20,7 +20,6 @@ interface Profile {
   dietary: string[];
   allergies: string[];
   brands: string;
-  walmart_session: string;
 }
 
 interface GroceryItem {
@@ -33,6 +32,7 @@ interface SearchResult {
   price: number;
   image: string;
   product_url: string;
+  asin: string;
 }
 
 interface SelectedProduct {
@@ -40,10 +40,11 @@ interface SelectedProduct {
   product_name: string;
   price: number;
   image_url: string;
-  product_url: string;
-  store: string;
+  product_url: string;  // always https://www.amazon.ca/dp/[ASIN]
+  store: string;        // always "Amazon.ca"
   swapped: boolean;
   quantity: string;
+  asin?: string;
 }
 
 // ─── Schedule ────────────────────────────────────────────────────────────────
@@ -105,11 +106,10 @@ async function solvePressAndHold(page: Page, buttonText: string): Promise<void> 
   }
 }
 
-// ─── Walmart search — Claude Vision reads the page ───────────────────────────
+// ─── Amazon search — Claude Vision reads the page ────────────────────────────
 
-async function searchWalmart(page: Page, query: string): Promise<SearchResult[]> {
-  const searchUrl = `https://www.walmart.ca/search?q=${encodeURIComponent(query)}`;
-
+async function searchAmazon(page: Page, query: string): Promise<SearchResult[]> {
+  const searchUrl = `https://www.amazon.ca/s?k=${encodeURIComponent(query)}`;
   try {
     await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
   } catch (err) {
@@ -117,8 +117,8 @@ async function searchWalmart(page: Page, query: string): Promise<SearchResult[]>
     return [];
   }
 
-  for (let attempt = 0; attempt < 5; attempt++) {
-    await page.waitForTimeout(3000);
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await page.waitForTimeout(4000);
     const screenshot = (await page.screenshot()).toString("base64");
     await saveScreenshot(page, `search-${query.replace(/\s/g, "_").substring(0, 15)}`);
 
@@ -131,21 +131,21 @@ async function searchWalmart(page: Page, query: string): Promise<SearchResult[]>
           { type: "image", source: { type: "base64", media_type: "image/png", data: screenshot } },
           {
             type: "text",
-            text: `Walmart Canada page after searching for "${query}". Respond with exactly ONE of:
+            text: `Amazon Canada search results for "${query}". Respond with exactly ONE of:
 
-CAPTCHA: <exact visible text on the button or challenge to interact with>
+CAPTCHA: <describe the challenge>
 
-PRODUCTS: [{"name":"...","price":4.97,"image_url":"https://...","product_url":"https://www.walmart.ca/en/ip/..."}]
+PRODUCTS: [{"name":"...","price":19.99,"asin":"B0XXXXXXXXX","image_url":"https://..."}]
 
 EMPTY
 
 LOADING
 
 Rules:
-- CAPTCHA if there is any bot check, verification page, or "press and hold" challenge
-- PRODUCTS if grocery products are listed — extract up to 8. Price as a number. For product_url use the /en/ip/ URL if visible in the page links, otherwise use ${searchUrl}
-- EMPTY if search ran but no products found
-- LOADING if page is still rendering
+- CAPTCHA if there is any robot check, verification, or CAPTCHA page
+- PRODUCTS if product listings are visible — extract up to 6 best matches. ASIN is the 10-character alphanumeric code (starts with B) found in product URLs like /dp/B0XXXXXXXXX/. Price as a number. Image URL if visible.
+- EMPTY if search completed but no products found
+- LOADING if the page is still loading
 - Respond ONLY with the keyword and data, nothing else`,
           },
         ],
@@ -156,28 +156,25 @@ Rules:
     console.log(`[SEARCH] "${query}" (${attempt + 1}): ${reply.substring(0, 120)}`);
 
     if (reply.startsWith("CAPTCHA:")) {
-      const challenge = reply.replace(/^CAPTCHA:\s*/i, "").trim();
-      console.log(`[CAPTCHA] "${challenge}" — attempting hold...`);
-      await solvePressAndHold(page, challenge);
+      await page.waitForTimeout(6000);
       try { await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 30000 }); } catch {}
       continue;
     }
-
-    if (reply.startsWith("LOADING")) { continue; }
-
-    if (reply.startsWith("EMPTY")) { return []; }
+    if (reply.startsWith("LOADING")) continue;
+    if (reply.startsWith("EMPTY")) return [];
 
     if (reply.startsWith("PRODUCTS:")) {
       try {
         const jsonStr = reply.replace(/^PRODUCTS:\s*/i, "").trim();
         const arr = JSON.parse(jsonStr.match(/\[[\s\S]*\]/)?.[0] ?? "[]");
         const results: SearchResult[] = arr
-          .filter((p: any) => p.name)
+          .filter((p: any) => p.name && p.asin)
           .map((p: any) => ({
             name: String(p.name),
             price: parseFloat(String(p.price ?? 0).replace(/[^0-9.]/g, "")) || 0,
             image: String(p.image_url ?? ""),
-            product_url: String(p.product_url ?? searchUrl),
+            product_url: `https://www.amazon.ca/dp/${String(p.asin).trim()}`,
+            asin: String(p.asin).trim(),
           }));
         console.log(`[SEARCH] "${query}" → ${results.length} products`);
         return results;
@@ -196,19 +193,19 @@ Rules:
 
 const SHOPPING_TOOLS: Anthropic.Tool[] = [
   {
-    name: "search_walmart",
-    description: "Search Walmart Canada for a product. Returns products with names, prices, and URLs. If you get 0 results, try a shorter or simpler search term.",
+    name: "search_amazon",
+    description: "Search Amazon Canada for a household product. Returns products with names, prices, and ASINs. If you get 0 results, try a shorter or simpler search term.",
     input_schema: {
       type: "object" as const,
       properties: {
-        query: { type: "string", description: "Search query (e.g. 'eggs', 'brioche', 'paper towels')" },
+        query: { type: "string", description: "Search query (e.g. 'paper towels', 'dish soap', 'laundry detergent')" },
       },
       required: ["query"],
     },
   },
   {
     name: "finalize_cart",
-    description: "Submit your final product selections for the entire grocery list. Call this once you've found products for all items (or exhausted searches).",
+    description: "Submit your final product selections. Call once you have found products for all items (or exhausted searches).",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -217,15 +214,16 @@ const SHOPPING_TOOLS: Anthropic.Tool[] = [
           items: {
             type: "object",
             properties: {
-              grocery_item_name: { type: "string", description: "Original grocery list item name only — e.g. 'Apple juice', never include qty info like '(qty: 1)'" },
-              product_name: { type: "string", description: "Exact product name found" },
-              price: { type: "number", description: "Price in CAD. If shown as 'price not shown' or 0, estimate a reasonable Canadian grocery price (e.g. bread ~$4, butter ~$6, juice ~$5). Never return 0." },
-              product_url: { type: "string", description: "Product URL from search results" },
-              image_url: { type: "string", description: "Image URL (empty string if none)" },
-              store: { type: "string", description: "Store name" },
-              not_found: { type: "boolean", description: "True if item couldn't be found after trying" },
+              grocery_item_name: { type: "string", description: "Original item name from the user's list" },
+              product_name: { type: "string", description: "Exact product name from Amazon" },
+              price: { type: "number", description: "Price in CAD. Never return 0 — estimate if needed." },
+              product_url: { type: "string", description: "Amazon product URL (https://www.amazon.ca/dp/ASIN)" },
+              image_url: { type: "string", description: "Product image URL (empty string if none)" },
+              store: { type: "string", description: "Always 'Amazon.ca'" },
+              asin: { type: "string", description: "10-character Amazon ASIN (e.g. B0XXXXXXXXX)" },
+              not_found: { type: "boolean", description: "True only if the item genuinely couldn't be found after trying" },
             },
-            required: ["grocery_item_name", "product_name", "price", "product_url", "image_url", "store", "not_found"],
+            required: ["grocery_item_name", "product_name", "price", "product_url", "image_url", "store", "asin", "not_found"],
           },
         },
       },
@@ -248,20 +246,21 @@ async function shopForGroceries(
   const messages: Anthropic.MessageParam[] = [
     {
       role: "user",
-      content: `You are a smart grocery shopper. Buy the following items on Walmart Canada:
+      content: `You are a smart household shopping assistant. Find the following household items on Amazon Canada (amazon.ca):
 
 ${itemList}
 
 User preferences:
 - Budget: $${profile.budget ?? "flexible"} CAD
-- Dietary: ${profile.dietary?.join(", ") || "none"}
-- Allergies: ${profile.allergies?.join(", ") || "none"}
+- Preferences: ${profile.dietary?.join(", ") || "none"}
+- Avoid: ${profile.allergies?.join(", ") || "none"}
 - Preferred brands: ${profile.brands || "no strong preference"}
 
 Shopping strategy:
-- Respect dietary restrictions and allergies strictly — never pick something that violates them.
-- If budget is set and total looks high, prefer store-brand or value options.
+- Respect any avoid/allergy restrictions — never pick something that violates them.
+- If budget is set, prefer value options.
 - If a search returns 0 results, try a simpler term before giving up.
+- Prefer items with ASINs (required for the Amazon cart to work).
 - Once you have everything (or genuinely exhausted options), call finalize_cart.
 
 Use your judgment. Be decisive.`,
@@ -288,14 +287,14 @@ Use your judgment. Be decisive.`,
     for (const block of response.content) {
       if (block.type !== "tool_use") continue;
 
-      if (block.name === "search_walmart") {
+      if (block.name === "search_amazon") {
         const { query } = block.input as { query: string };
-        const results = await searchWalmart(page, query);
+        const results = await searchAmazon(page, query);
 
         const resultText = results.length > 0
-          ? `Found ${results.length} products at Walmart Canada:\n` +
+          ? `Found ${results.length} products on Amazon.ca:\n` +
             results.map((r, i) =>
-              `${i + 1}. ${r.name} — $${r.price > 0 ? r.price : "price not shown"} CAD | URL: ${r.product_url} | Image: ${r.image}`
+              `${i + 1}. ${r.name} — $${r.price > 0 ? r.price : "price not shown"} CAD | ASIN: ${r.asin} | URL: ${r.product_url} | Image: ${r.image}`
             ).join("\n")
           : `No results for "${query}". Try a simpler or different search term.`;
 
@@ -306,11 +305,10 @@ Use your judgment. Be decisive.`,
         const { selections } = block.input as {
           selections: Array<{
             grocery_item_name: string; product_name: string; price: number;
-            product_url: string; image_url: string; store: string; not_found: boolean;
+            product_url: string; image_url: string; store: string; asin: string; not_found: boolean;
           }>;
         };
 
-        // Map back to SelectedProduct, filling in quantity from original items
         finalSelections = selections.map((s) => {
           const original = items.find(i => i.name.toLowerCase() === s.grocery_item_name.toLowerCase());
           console.log(s.not_found
@@ -322,10 +320,11 @@ Use your judgment. Be decisive.`,
             product_name: s.not_found ? `Search for "${s.grocery_item_name}"` : s.product_name,
             price: s.price,
             image_url: s.image_url,
-            product_url: s.product_url || `https://www.walmart.ca/search?q=${encodeURIComponent(s.grocery_item_name)}`,
-            store: s.store,
+            product_url: s.product_url || `https://www.amazon.ca/s?k=${encodeURIComponent(s.grocery_item_name)}`,
+            store: "Amazon.ca",
             swapped: false,
             quantity: original?.quantity ?? "1",
+            asin: s.asin || "",
           };
         });
 
@@ -357,7 +356,7 @@ async function validateCartWithClaude(
     max_tokens: 400,
     messages: [{
       role: 'user',
-      content: `Quick grocery cart review. Flag ONLY serious problems — wrong product category, allergen violations, or dietary violations.
+      content: `Quick household cart review. Flag ONLY serious problems — wrong product category, allergen violations, or dietary violations.
 
 User dietary: ${profile.dietary?.join(', ') || 'none'}
 User allergies: ${profile.allergies?.join(', ') || 'none'}
@@ -388,112 +387,20 @@ Return ONLY the JSON array, no other text.`,
   return selectedProducts;
 }
 
-// ─── Claude-guided Walmart cart addition (vision) ─────────────────────────────
+// ─── Amazon cart URL builder ──────────────────────────────────────────────────
 
-function chunkArray<T>(arr: T[], size: number): T[][] {
-  const chunks: T[][] = [];
-  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
-  return chunks;
-}
-
-async function addProductWithClaude(page: Page, product: SelectedProduct, workerIdx: number): Promise<boolean> {
-  if (!product.product_url || product.product_name.startsWith('Search for "')) return false;
-
-  try {
-    await page.goto(product.product_url, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await page.waitForTimeout(3000);
-
-    for (let attempt = 0; attempt < 6; attempt++) {
-      const screenshot = (await page.screenshot()).toString("base64");
-
-      const response = await anthropic.messages.create({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 120,
-        messages: [{
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: "image/png", data: screenshot } },
-            {
-              type: "text",
-              text: `Walmart Canada page. Goal: add "${product.product_name}" to cart.
-
-Reply with exactly one of:
-CLICK: <exact button text to click>
-HOLD: <exact text on the press-and-hold challenge button>
-DISMISS: <exact text on a popup to close first>
-DONE
-FAIL: <reason>`,
-            },
-          ],
-        }],
-      });
-
-      const reply = ((response.content[0] as Anthropic.TextBlock).text ?? "").trim();
-      console.log(`[W${workerIdx}] ${product.grocery_item_name} (${attempt + 1}): ${reply}`);
-
-      if (reply.startsWith("DONE")) return true;
-      if (reply.startsWith("FAIL")) return false;
-
-      const holdMatch = reply.match(/^HOLD:\s*(.+)/i);
-      if (holdMatch) {
-        await solvePressAndHold(page, holdMatch[1].trim());
-        // After solving CAPTCHA, reload the product page
-        try { await page.goto(product.product_url, { waitUntil: "domcontentloaded", timeout: 30000 }); } catch {}
-        await page.waitForTimeout(3000);
-        continue;
-      }
-
-      const clickMatch = reply.match(/^CLICK:\s*(.+)/i);
-      const dismissMatch = reply.match(/^DISMISS:\s*(.+)/i);
-      const label = (clickMatch?.[1] ?? dismissMatch?.[1] ?? "").trim();
-      if (!label) return false;
-
-      const clicked = await page.getByRole("button", { name: label, exact: false }).first()
-        .click({ force: true })
-        .then(() => true)
-        .catch(() =>
-          page.getByText(label, { exact: false }).first()
-            .click({ force: true })
-            .then(() => true)
-            .catch(() => false)
-        );
-
-      if (!clicked) { console.log(`[W${workerIdx}] Couldn't click "${label}"`); return false; }
-      await page.waitForTimeout(1500);
-
-      if (clickMatch) return true;
+function buildAmazonCartUrl(products: SelectedProduct[]): string {
+  const params: string[] = [];
+  let idx = 1;
+  for (const p of products) {
+    const asin = p.asin || p.product_url?.match(/\/dp\/([A-Z0-9]{10})/)?.[1];
+    if (asin) {
+      params.push(`ASIN.${idx}=${asin}`, `Quantity.${idx}=1`);
+      idx++;
     }
-  } catch (err) {
-    console.log(`[W${workerIdx}] Error on ${product.grocery_item_name}: ${err}`);
   }
-
-  return false;
-}
-
-async function addProductsParallel(browser: Browser, profile: Profile, products: SelectedProduct[]): Promise<number> {
-  const valid = products.filter(p => p.product_url && !p.product_name.startsWith('Search for "'));
-  if (!valid.length) return 0;
-
-  const WORKERS = Math.min(3, valid.length);
-  const chunks = chunkArray(valid, Math.ceil(valid.length / WORKERS));
-  console.log(`\nAdding ${valid.length} items to Walmart (${WORKERS} parallel workers)...`);
-
-  const counts = await Promise.all(
-    chunks.map(async (chunk, idx) => {
-      const ctx = await buildBrowserContext(browser, profile);
-      const page = await ctx.newPage();
-      let added = 0;
-      for (const product of chunk) {
-        const ok = await addProductWithClaude(page, product, idx + 1);
-        console.log(ok ? `✓ [W${idx + 1}] ${product.product_name}` : `✗ [W${idx + 1}] ${product.grocery_item_name}`);
-        if (ok) added++;
-      }
-      await ctx.close();
-      return added;
-    })
-  );
-
-  return counts.reduce((s, n) => s + n, 0);
+  if (!params.length) return "https://www.amazon.ca";
+  return `https://www.amazon.ca/gp/aws/cart/add.html?${params.join("&")}`;
 }
 
 // ─── Email summary (Claude-written) ──────────────────────────────────────────
@@ -501,8 +408,7 @@ async function addProductsParallel(browser: Browser, profile: Profile, products:
 async function generateEmailSummary(
   selectedProducts: SelectedProduct[],
   total: number,
-  walmartAdded: boolean,
-  addedCount: number,
+  amazonCartUrl: string,
 ): Promise<string> {
   const found = selectedProducts.filter(p => !p.product_name.startsWith('Search for "'));
   const notFound = selectedProducts.filter(p => p.product_name.startsWith('Search for "'));
@@ -513,9 +419,6 @@ async function generateEmailSummary(
     stores.length > 0 ? `Store(s): ${stores.join(", ")}.` : "",
     `Estimated total: ~$${total.toFixed(2)} CAD.`,
     notFound.length > 0 ? `Not found: ${notFound.map(p => p.grocery_item_name).join(", ")}.` : "",
-    walmartAdded
-      ? `Successfully added ${addedCount} item(s) directly to the user's Walmart cart.`
-      : "Items were not automatically added to Walmart (session may have expired).",
   ].filter(Boolean).join(" ");
 
   const itemLines = found.map(p =>
@@ -530,7 +433,7 @@ async function generateEmailSummary(
     max_tokens: 900,
     messages: [{
       role: "user",
-      content: `Write a fun, warm, slightly playful HTML email body for a smart grocery shopping app called SGA. Personality: like a helpful friend who just did your shopping for you.
+      content: `Write a fun, warm, slightly playful HTML email body for a smart household shopping app called Restock. Personality: like a helpful friend who just did your shopping for you.
 
 Shopping results:
 ${context}
@@ -541,9 +444,9 @@ ${notFoundLines ? `\nNot found:\n${notFoundLines}` : ""}
 
 Instructions:
 - Start with a short punchy line (1 sentence) — make it fun, not corporate
-- Then show the item list as HTML: each item on its own line with a relevant food emoji at the start, the product name, and price. Use <ul> with no bullets (list-style:none), each <li> styled with padding.
+- Then show the item list as HTML: each item on its own line with a relevant emoji at the start, the product name, and price. Use <ul> with no bullets (list-style:none), each <li> styled with padding.
 - If items weren't found, mention them briefly at the end with a 😅 or similar
-- End with a clear call to action: ${walmartAdded ? '"Your Walmart cart is loaded — just open walmart.ca and checkout! 🎉"' : '"Open SGA → Cart tab to add your items to Walmart"'}
+- End with a clear call to action: "Open your Amazon cart to add all items in one tap: <a href="${amazonCartUrl}">Open Amazon Cart →</a>"
 - Keep the whole thing under 200 words
 - Output ONLY raw HTML — no markdown, no backticks, no code fences, no \`\`\`html wrapper
 - Start your response directly with the first HTML element`,
@@ -558,62 +461,6 @@ Instructions:
     .trim();
 }
 
-// ─── Session setup ────────────────────────────────────────────────────────────
-
-async function buildBrowserContext(browser: Browser, profile: Profile) {
-  type SessionData = {
-    storageState?: { cookies: any[]; origins: any[] };
-    cookies?: string;
-    localStorage?: Record<string, string>;
-  };
-
-  let sessionData: SessionData = {};
-  if (profile?.walmart_session) {
-    try { sessionData = JSON.parse(profile.walmart_session); } catch { /* skip */ }
-  }
-
-  if (sessionData.storageState) {
-    console.log(`Using full storageState (${sessionData.storageState.cookies.length} cookies incl. HttpOnly)`);
-    return browser.newContext({
-      storageState: sessionData.storageState as any,
-      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      viewport: { width: 1280, height: 800 },
-      locale: "en-CA",
-    });
-  }
-
-  const context = await browser.newContext({
-    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    viewport: { width: 1280, height: 800 },
-    locale: "en-CA",
-  });
-
-  if (sessionData.localStorage && Object.keys(sessionData.localStorage).length > 0) {
-    await context.addInitScript((ls) => {
-      for (const [k, v] of Object.entries(ls)) {
-        try { localStorage.setItem(k, v as string); } catch { }
-      }
-    }, sessionData.localStorage);
-    console.log(`Injected ${Object.keys(sessionData.localStorage).length} localStorage entries`);
-  }
-
-  if (sessionData.cookies) {
-    const parsed = sessionData.cookies.split(";")
-      .map((c) => {
-        const eq = c.indexOf("=");
-        if (eq === -1) return null;
-        return { name: c.substring(0, eq).trim(), value: c.substring(eq + 1).trim(), domain: ".walmart.ca", path: "/" };
-      })
-      .filter((c): c is NonNullable<typeof c> => !!c?.name && !!c?.value);
-    if (parsed.length > 0) {
-      await context.addCookies(parsed);
-      console.log(`Injected ${parsed.length} session cookies`);
-    }
-  }
-
-  return context;
-}
-
 // ─── Process one user ─────────────────────────────────────────────────────────
 
 async function processUser(userId: string, browser: Browser): Promise<void> {
@@ -623,74 +470,77 @@ async function processUser(userId: string, browser: Browser): Promise<void> {
   ]);
 
   const items: GroceryItem[] = itemsRes.data ?? [];
-  const profile: Profile = profileRes.data;
+  const profile: Profile = profileRes.data ?? {} as Profile;
 
   if (!items.length) { console.log(`No items for ${userId}`); return; }
-
   console.log(`\nShopping ${items.length} items for user ${userId}`);
 
   const authRes = await supabase.auth.admin.getUserById(userId);
   const userEmail = authRes.data?.user?.email;
   if (!userEmail) return;
 
-  const context = await buildBrowserContext(browser, profile);
+  // No auth cookies needed — Amazon doesn't require login for search
+  const context = await browser.newContext({
+    userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    viewport: { width: 1280, height: 800 },
+    locale: "en-CA",
+  });
   const page = await context.newPage();
 
-  console.log(`\nStarting agentic shop for ${items.length} items...`);
+  console.log(`\nStarting agentic shop for ${items.length} items on Amazon.ca...`);
   const selectedProducts = await shopForGroceries(page, items, profile);
-
-  // Claude reviews the cart for obvious errors (wrong category, allergen violations, etc.)
   const validatedProducts = await validateCartWithClaude(selectedProducts, items, profile);
 
+  await context.close();
+
   if (validatedProducts.length === 0) {
-    await context.close();
     console.log("No products found, skipping cart creation.");
     return;
   }
 
-  await context.close();
-
-  // Add directly to the user's Walmart cart — parallel Claude-vision workers
-  let walmartAdded = false;
-  let addedCount = 0;
-  if (profile.walmart_session) {
-    addedCount = await addProductsParallel(browser, profile, validatedProducts);
-    walmartAdded = addedCount > 0;
-    console.log(`Walmart: ${addedCount}/${validatedProducts.filter(p => !p.product_name.startsWith('Search for "')).length} items added`);
-  }
-
   const total = validatedProducts.reduce((sum, p) => sum + (p.price ?? 0), 0);
+  const amazonCartUrl = buildAmazonCartUrl(validatedProducts);
 
   const { data: cart, error: cartError } = await supabase
     .from("carts")
-    .insert({ user_id: userId, status: "pending", total: parseFloat(total.toFixed(2)), platform: "walmart" })
+    .insert({ user_id: userId, status: "pending", total: parseFloat(total.toFixed(2)), platform: "amazon" })
     .select("id")
     .single();
 
   if (cartError || !cart) throw new Error(`Cart creation failed: ${cartError?.message}`);
 
-  await supabase.from("cart_items").insert(validatedProducts.map((p) => ({ cart_id: cart.id, ...p })));
+  await supabase.from("cart_items").insert(
+    validatedProducts.map((p) => ({
+      cart_id: cart.id,
+      grocery_item_name: p.grocery_item_name,
+      product_name: p.product_name,
+      price: p.price,
+      image_url: p.image_url,
+      product_url: p.product_url,
+      store: p.store,
+      swapped: false,
+      quantity: p.quantity,
+    }))
+  );
+
   await supabase.from("grocery_items").update({ cleared: true }).eq("user_id", userId).eq("cleared", false);
 
-  const emailBody = await generateEmailSummary(validatedProducts, total, walmartAdded, addedCount);
-  const subject = walmartAdded
-    ? `✅ ${addedCount} items added to Walmart — ~$${total.toFixed(2)} CAD`
-    : `🛒 Cart ready — ${validatedProducts.length} items ~$${total.toFixed(2)} CAD`;
-
+  const emailBody = await generateEmailSummary(validatedProducts, total, amazonCartUrl);
   await resend.emails.send({
     from: "onboarding@resend.dev",
     to: userEmail,
-    subject,
+    subject: `🛒 Your Restock cart is ready — ${validatedProducts.length} items ~$${total.toFixed(2)} CAD`,
     html: emailBody,
   });
 
-  console.log(`\nDone: ${validatedProducts.length} items, $${total.toFixed(2)} CAD, Walmart added: ${walmartAdded}`);
+  console.log(`\nDone: ${validatedProducts.length} items, $${total.toFixed(2)} CAD`);
+  console.log(`Amazon cart URL: ${amazonCartUrl}`);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  console.log("SGA Agent starting...");
+  console.log("Restock Agent starting...");
   const userIds = await getUsersToShopFor();
   console.log(`Users to shop for: ${userIds.length}`);
   if (!userIds.length) return;
@@ -701,7 +551,7 @@ async function main(): Promise<void> {
     catch (err) { console.error(`Error for ${userId}:`, err); }
   }
   await browser.close();
-  console.log("SGA Agent done.");
+  console.log("Restock Agent done.");
 }
 
 main();

@@ -39,7 +39,7 @@ Deno.serve(async (req) => {
 
   const context = [
     `Found ${found.length} of ${cart_items.length} items.`,
-    stores.length > 0 ? `Shopping at: ${stores.join(' and ')}.` : '',
+    stores.length > 0 ? `On Amazon.ca: ${stores.join(' and ')}.` : '',
     `Estimated total: $${total.toFixed(2)} CAD${budget ? ` (budget: $${budget})` : ''}.`,
     notFound.length > 0
       ? `Couldn't find: ${notFound.map((i: any) => i.grocery_item_name).join(', ')}.`
@@ -54,7 +54,7 @@ Deno.serve(async (req) => {
     max_tokens: 120,
     messages: [{
       role: 'user',
-      content: `Write a single brief, friendly sentence summarising this grocery cart for the user. Be specific — mention the store, count, and anything notable (great deal, item not found, over budget). No greeting, no punctuation at end, no markdown.\n\n${context}`,
+      content: `Write a single brief, friendly sentence summarising this Restock cart for the user. Be specific — mention Amazon.ca and the savings or value, count, and anything notable (great deal, household item not found, over budget). No greeting, no punctuation at end, no markdown.\n\n${context}`,
     }],
   })
 
